@@ -1,0 +1,7 @@
+[Unit]
+Description=GC de disco: /tmp de la caja, caches de worktrees inactivos, worktrees seguros (boxctl gc)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agent-box/box.env
+ExecStart=/usr/local/bin/boxctl --json gc --alcance disco $GC_APLICAR

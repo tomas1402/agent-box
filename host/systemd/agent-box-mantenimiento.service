@@ -1,0 +1,6 @@
+[Unit]
+Description=Mantenimiento diario de la box de agentes (boxctl mantenimiento)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/boxctl --json mantenimiento

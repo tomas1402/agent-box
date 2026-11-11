@@ -1,0 +1,15 @@
+[Unit]
+Description=Reaplica la allowlist de egress de la caja al arrancar (las reglas de iptables no persisten)
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/agent-box/egress-habilitado
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/agent-box-egress aplicar --deadman 600
+# Al boot se confirma directo (falla cerrado): las reglas ya se verificaron una vez a mano al habilitarlas.
+ExecStartPost=/usr/local/sbin/agent-box-egress confirmar
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+{
+  "name": "agent-box",
+  "version": "0.1.0",
+  "description": "Operar la box de agentes (nodos como nodo-a y nodo-b) desde Claude Code: envoltorio de boxctl.",
+  "author": {"name": "Tomás Pichierri"}
+}

@@ -1,0 +1,7 @@
+{
+  "_comentario": "Va en ~/.config/agent-box/nodos.json de la maquina del operador. ssh = alias de ~/.ssh/config del usuario admin del nodo (no el de agent). Con una VPN tipo Tailscale, HostName = nombre MagicDNS. Opcional por nodo: \"perfil\" (perfil de memoria de boxd; por defecto el nombre del nodo).",
+  "nodos": [
+    {"nombre": "nodo-a", "ssh": "nodo-a-admin", "orcaEnvironment": "nodo-a", "habilitado": true},
+    {"nombre": "nodo-b", "ssh": "nodo-b-admin", "orcaEnvironment": "nodo-b", "habilitado": false}
+  ]
+}

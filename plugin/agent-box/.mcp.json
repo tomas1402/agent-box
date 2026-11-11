@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agent-box": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/boxctl_mcp.py"],
+      "env": {"BOXCTL": "boxctl"}
+    }
+  }
+}

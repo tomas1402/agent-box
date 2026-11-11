@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# orca-agent-shell v2 — shell del usuario agent en cada nodo: toda sesion SSH cae DENTRO de la
+# caja (contenedor con techo), nunca en el host.
+#
+# Cambios contra v1:
+#   - Unica fuente de limites: /etc/agent-box/box.env. Sin el archivo, NO arranca (v1 caia a
+#     defaults en silencio y aparecia deriva entre lo esperado y lo real).
+#   - --memory-swap = --memory (v1 dejaba swap 2x: la caja podia empujar el host a swap).
+#   - --shm-size desde box.env (v1: 64 MB, corto para Chromium en paralelo).
+#   - Red propia (RED, con subred fija) para que el firewall de egress la pueda filtrar.
+#   - ~/.orca persistente (ORCA_STATE): caja-reiniciar ya no cambia la identidad del orcad.
+#   - Label agent-box.config = hash de box.env: boxctl estado detecta deriva.
+#   - Escribe /etc/agent-box/limites.env ADENTRO de la caja para gate-lock (slots por RAM).
+#   - La identidad git global se regenera desde box.env (GIT_NAME,
+#     GIT_EMAIL) en cada caja nueva: antes se perdia ~/.gitconfig al recrear. Se regenera y no se
+#     bind-montea porque git reescribe el archivo con rename y un bind de archivo da EBUSY.
+#   - CLAUDE_STATE (opcional): ~/.claude persistente (settings, hooks, sesiones) entre recreaciones.
+#   - NODE_HEAP_MB: NODE_OPTIONS=--max-old-space-size para cada proceso node (un worker de jest no
+#     crece sin techo). No se usa ulimit -v: node reserva mucho espacio virtual y no arranca.
+#
+# El workspace es bind-mount en el mismo path a ambos lados (sftp/git del host y el agente ven
+# los mismos archivos). Secretos: /etc/orca-agent/secrets.env (root:agent 640) por --env-file.
+set -uo pipefail
+
+CONTAINER=orca-agent-box
+CONF=/etc/agent-box/box.env
+SECRETS=/etc/orca-agent/secrets.env
+
+[ -r "$CONF" ] || { echo "orca-agent-shell: falta $CONF (correr install.sh)" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+for v in IMAGE RUNTIME MEM_GB CPUS SHM PIDS RED WORKSPACE ORCA_STATE; do
+  [ -n "${!v:-}" ] || { echo "orca-agent-shell: $CONF sin $v" >&2; exit 1; }
+done
+CONF_HASH=$(sha256sum "$CONF" | cut -c1-16)
+
+ensure_box() {
+  local estado
+  estado="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)"
+  case "$estado" in
+    running) return 0 ;;
+    exited|created|paused) docker start "$CONTAINER" >/dev/null 2>&1 && return 0 ;;
+  esac
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  local extra=()
+  [ -r "$SECRETS" ] && extra+=(--env-file "$SECRETS")
+  [ -n "${NODE_HEAP_MB:-}" ] && extra+=(-e "NODE_OPTIONS=--max-old-space-size=$NODE_HEAP_MB")
+  [ -n "${CLAUDE_STATE:-}" ] && extra+=(-v "$CLAUDE_STATE:/home/agent/.claude")
+  if [ -n "${DNS:-}" ]; then
+    local d; IFS=',' read -ra _dns <<<"$DNS"; for d in "${_dns[@]}"; do extra+=(--dns "$d"); done
+  fi
+  docker run -d --name "$CONTAINER" "${extra[@]}" \
+    --runtime "$RUNTIME" --init \
+    --label orca.box=compartida --label "agent-box.config=$CONF_HASH" --label "agent-box.nodo=${NODO:-?}" \
+    --memory "${MEM_GB}g" --memory-swap "${MEM_GB}g" --cpus "$CPUS" \
+    --pids-limit "$PIDS" --shm-size "$SHM" \
+    --network "$RED" \
+    --restart unless-stopped \
+    -v "$WORKSPACE:$WORKSPACE" \
+    -v "$ORCA_STATE:/home/agent/.orca" \
+    -w "$WORKSPACE" \
+    --entrypoint sleep \
+    "$IMAGE" infinity >/dev/null || return 1
+  # Limites para gate-lock (adentro de la caja no hay acceso a box.env).
+  printf 'AGENTE_GB=%s\nSUITE_GB=%s\nRESERVA_GB=%s\nSUITES_MIN=%s\nSUITES_MAX=%s\n' \
+    "${AGENTE_GB:-0.6}" "${SUITE_GB:-4}" "${RESERVA_GB:-1}" "${SUITES_MIN:-1}" "${SUITES_MAX:-3}" |
+    docker exec -i -u root "$CONTAINER" sh -c 'mkdir -p /etc/agent-box && cat > /etc/agent-box/limites.env && chmod 644 /etc/agent-box/limites.env' || true
+  # Bajo gVisor el DNS embebido de Docker (127.0.0.11) no responde en una red propia: la caja queda
+  # sin resolver nombres (visto en la practica). Con DNS en box.env se escribe directo.
+  if [ "$RUNTIME" = runsc ] && [ -n "${DNS:-}" ]; then
+    local ns; ns=$(printf '%s' "$DNS" | tr ',' '\n' | sed 's/^/nameserver /')
+    printf '%s\n' "$ns" | docker exec -i -u root "$CONTAINER" sh -c 'cat > /etc/resolv.conf' || true
+  fi
+  # Identidad git global de la caja (se perdia al recrear; los commits son de la persona que opera).
+  if [ -n "${GIT_NAME:-}" ] && [ -n "${GIT_EMAIL:-}" ]; then
+    docker exec -u agent "$CONTAINER" git config --global user.name "$GIT_NAME" >/dev/null 2>&1 || true
+    docker exec -u agent "$CONTAINER" git config --global user.email "$GIT_EMAIL" >/dev/null 2>&1 || true
+  fi
+  # git: GitHub via gh (GH_TOKEN del entorno); Azure DevOps con el PAT solo en el "get" del helper.
+  # Nunca extraHeader, nunca token escrito en un gitconfig.
+  docker exec -u root "$CONTAINER" git config --system credential.https://github.com.helper '!gh auth git-credential' >/dev/null 2>&1 || true
+  docker exec -u root "$CONTAINER" git config --system credential.https://dev.azure.com.helper \
+    '!f() { [ "$1" = get ] && [ -n "$AZURE_DEVOPS_PAT" ] && printf "username=pat\npassword=%s\n" "$AZURE_DEVOPS_PAT"; }; f' >/dev/null 2>&1 || true
+}
+
+ensure_box || { echo 'no se pudo levantar el contenedor de agente' >&2; exit 1; }
+
+# Como SHELL del usuario (chsh), sshd invoca: orca-agent-shell -c "<comando>".
+cmd=""
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+  cmd="$SSH_ORIGINAL_COMMAND"
+elif [ "${1:-}" = "-c" ]; then
+  shift; cmd="$*"
+elif [ "$#" -gt 0 ]; then
+  cmd="$*"
+fi
+
+if [ -n "$cmd" ]; then
+  exec docker exec -i -u agent -w "$WORKSPACE" "$CONTAINER" bash -lc "$cmd"
+fi
+if [ -t 0 ]; then
+  exec docker exec -i -t -u agent -w "$WORKSPACE" "$CONTAINER" bash -l
+else
+  exec docker exec -i -u agent -w "$WORKSPACE" "$CONTAINER" bash -l
+fi

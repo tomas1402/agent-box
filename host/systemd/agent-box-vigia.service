@@ -1,0 +1,7 @@
+[Unit]
+Description=Vigia de memoria: alerta al MEM_ALERTA_PCT y corta la suite mas grande al MEM_CORTE_PCT
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agent-box/box.env
+ExecStart=/usr/local/bin/boxctl --json gc --alcance memoria $GC_APLICAR

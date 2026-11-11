@@ -1,0 +1,1282 @@
+#!/usr/bin/env python3
+"""boxctl: interfaz canonica de la box de agentes.
+
+Un solo archivo, Python 3 sin dependencias. Contrato en docs/contrato.md (version CONTRATO).
+
+Dos dominios:
+  verbos de nodo  (corren como root EN el nodo; desde la Mac se reenvian por ssh con --nodo)
+      estado | suites | limpiar [--aplicar] | podar <path> | caja-reiniciar [--forzar]
+      mantenimiento | logs [-n N] | firewall estado|aplicar|confirmar|quitar|verificar
+      gc [--alcance memoria|procesos|disco|todo] [--aplicar] | salvar [--aplicar]
+  verbos de pool  (corren en la Mac: Orca solo existe ahi)
+      nodos | worker lista | worker alta | worker baja | panel
+  version
+
+Salida: humana por defecto; --json = un objeto JSON por invocacion en stdout, siempre, tambien
+en error. Exit codes fijos (tabla ERRORES).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONTRATO = 1
+VERSION = "0.1.0"
+
+BOX_ENV = Path("/etc/agent-box/box.env")
+LOG = Path("/var/log/agent-box.jsonl")
+EGRESS = "/usr/local/sbin/agent-box-egress"
+WRAPPER = "/usr/local/bin/orca-agent-shell"
+NODOS_JSON = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-box" / "nodos.json"
+BOX = "orca-agent-box"
+GATE_DIR = "/tmp/harness-gate-lock/test"
+GIB = 1024 ** 3
+
+# codigo -> exit code. Estable: no se renumera, solo se agrega al final.
+ERRORES = {
+    "error_interno": 1,
+    "operacion_invalida": 2,
+    "nodo_inalcanzable": 3,
+    "capacidad_insuficiente": 4,
+    "worker_no_existe": 5,
+    "caja_ocupada": 6,
+    "cuota_excedida": 7,
+    "permiso": 8,
+    "nodo_desconocido": 9,
+    "dependencia_faltante": 10,
+    "repo_no_registrado": 11,
+    "config_invalida": 12,
+    "worker_activo": 13,
+    "worker_sucio": 14,
+}
+
+DEFAULTS = {
+    "AGENTE_GB": "0.6", "SUITE_GB": "4", "RESERVA_GB": "1",
+    "SUITES_MAX": "3", "SUITES_MIN": "1", "WORKERS_MAX": "4",
+}
+REQUERIDAS = ("NODO", "IMAGE", "RUNTIME", "MEM_GB", "CPUS", "SHM", "PIDS", "RED", "ORCA_STATE", "WORKSPACE")
+
+
+class BoxError(Exception):
+    def __init__(self, codigo: str, mensaje: str, detalle: dict | None = None):
+        assert codigo in ERRORES, codigo
+        super().__init__(mensaje)
+        self.codigo, self.mensaje, self.detalle = codigo, mensaje, detalle or {}
+
+
+# ---------------------------------------------------------------- utilidades
+
+def sh(cmd: list[str], timeout: int = 60, inp: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=inp)
+    except FileNotFoundError:
+        raise BoxError("dependencia_faltante", f"no esta instalado: {cmd[0]}")
+    except subprocess.TimeoutExpired:
+        raise BoxError("error_interno", f"timeout ({timeout}s): {' '.join(cmd[:3])}")
+
+
+def ahora() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def leer_env(path: Path) -> dict:
+    if not path.exists():
+        raise BoxError("config_invalida", f"falta {path}: este host no es un nodo instalado (install.sh)")
+    out = {}
+    for linea in path.read_text().splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#") or "=" not in linea:
+            continue
+        k, v = linea.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    faltan = [k for k in REQUERIDAS if not out.get(k)]
+    if faltan:
+        raise BoxError("config_invalida", f"{path} sin: {', '.join(faltan)}")
+    for k, v in DEFAULTS.items():
+        out.setdefault(k, v)
+    return out
+
+
+def hash_env(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def bitacora(operacion: str, resultado: str, **extra) -> None:
+    """Auditoria: una linea JSON por operacion que cambia algo. Nunca secretos."""
+    reg = {"ts": ahora(), "op": operacion, "resultado": resultado,
+           "quien": os.environ.get("SUDO_USER") or os.environ.get("USER", "?"), **extra}
+    try:
+        with LOG.open("a") as f:
+            f.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- capacidad (formula unica)
+
+def capacidad(mem_caja_gb: float, agentes: int, mem_libre_gb: float, lim: dict) -> dict:
+    """Formula de admision y de slots de suites. gate-lock.sh replica la de slots en bash.
+
+    suitesCaben  = clamp(floor((MEM - agentes*AGENTE - RESERVA) / SUITE), SUITES_MIN, SUITES_MAX)
+    workersCaben = max(0, min(WORKERS_MAX - agentes, floor((libre - SUITE) / AGENTE)))
+    (un worker nuevo entra solo si ademas queda lugar para una suite)
+    """
+    a, s, r = float(lim["AGENTE_GB"]), float(lim["SUITE_GB"]), float(lim["RESERVA_GB"])
+    smin, smax, wmax = int(lim["SUITES_MIN"]), int(lim["SUITES_MAX"]), int(lim["WORKERS_MAX"])
+    suites = math.floor(round((mem_caja_gb - agentes * a - r) / s, 6))
+    suites = max(smin, min(smax, suites))
+    por_ram = math.floor(round((mem_libre_gb - s) / a, 6)) if mem_libre_gb > s else 0
+    workers = max(0, min(wmax - agentes, por_ram))
+    return {"suitesCaben": suites, "workersCaben": workers, "agentes": agentes,
+            "memCajaGb": round(mem_caja_gb, 2), "memLibreGb": round(mem_libre_gb, 2)}
+
+
+def _gb(txt: str) -> float:
+    m = re.match(r"([\d.]+)\s*([KMGT]?i?B)", txt.strip())
+    if not m:
+        return 0.0
+    n, u = float(m.group(1)), m.group(2)
+    mult = {"B": 1, "KiB": 1024, "KB": 1e3, "MiB": 1024 ** 2, "MB": 1e6, "GiB": GIB, "GB": 1e9,
+            "TiB": 1024 ** 4, "TB": 1e12}.get(u, 1)
+    return n * mult / GIB
+
+
+# ---------------------------------------------------------------- verbos de nodo
+
+def inspeccionar_caja() -> dict | None:
+    r = sh(["docker", "inspect", BOX])
+    if r.returncode:
+        return None
+    return json.loads(r.stdout)[0]
+
+
+def deriva(cfg: dict, caja: dict | None, cfg_hash: str) -> list[dict]:
+    """Diferencias entre box.env (unica fuente) y la caja viva."""
+    if caja is None:
+        return []
+    hc, labels = caja.get("HostConfig", {}), caja.get("Config", {}).get("Labels") or {}
+    mem = int(cfg["MEM_GB"]) * GIB
+    esperado = {
+        "memoria": (mem, hc.get("Memory")),
+        "swap": (mem, hc.get("MemorySwap")),
+        "cpus": (int(float(cfg["CPUS"]) * 1e9), hc.get("NanoCpus")),
+        "runtime": (cfg["RUNTIME"], hc.get("Runtime")),
+        "init": (True, bool(hc.get("Init"))),
+        "pids": (int(cfg["PIDS"]), hc.get("PidsLimit")),
+        "red": (cfg["RED"], hc.get("NetworkMode")),
+        "config": (cfg_hash, labels.get("agent-box.config")),
+    }
+    mounts = {m.get("Destination") for m in caja.get("Mounts", [])}
+    esperado["orcaPersistente"] = (True, "/home/agent/.orca" in mounts)
+    return [{"campo": k, "esperado": e, "actual": a} for k, (e, a) in esperado.items() if e != a]
+
+
+def contar_agentes(estricto: bool = False) -> int:
+    """estricto: si la caja no responde no se sabe cuantos agentes hay, y eso no es cero."""
+    r = sh(["docker", "exec", BOX, "ps", "-eo", "comm="])
+    if r.returncode:
+        if estricto:
+            raise BoxError("caja_ocupada", "la caja no responde a docker exec: no se puede contar agentes. "
+                           "Revisar con docker inspect; --forzar solo con OK de quien opera",
+                           {"stderr": (r.stderr or "").strip()[:200]})
+        return 0
+    return sum(1 for l in r.stdout.splitlines() if l.strip() in ("claude", "codex"))
+
+
+def zombies() -> int:
+    r = sh(["docker", "exec", BOX, "ps", "-eo", "stat="])
+    return sum(1 for l in r.stdout.splitlines() if l.startswith("Z")) if r.returncode == 0 else 0
+
+
+def mem_caja() -> tuple[float, float]:
+    """(usada, limite) en GB segun docker stats."""
+    r = sh(["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}", BOX], timeout=30)
+    if r.returncode or "/" not in r.stdout:
+        return 0.0, 0.0
+    u, l = r.stdout.split("/", 1)
+    return _gb(u), _gb(l)
+
+
+def host_mem() -> dict:
+    info = {}
+    for linea in Path("/proc/meminfo").read_text().splitlines():
+        k, v = linea.split(":", 1)
+        info[k] = int(v.split()[0]) * 1024
+    return {"totalGb": round(info["MemTotal"] / GIB, 2), "disponibleGb": round(info["MemAvailable"] / GIB, 2),
+            "swapUsadoGb": round((info["SwapTotal"] - info["SwapFree"]) / GIB, 2)}
+
+
+def slots_ocupados() -> list[dict]:
+    r = sh(["docker", "exec", BOX, "sh", "-c",
+            f"for f in {GATE_DIR}/slot-*.lock; do [ -e \"$f\" ] || continue; flock -n \"$f\" true || basename \"$f\" .lock; done; "
+            f"for d in {GATE_DIR}/slot-*; do [ -d \"$d\" ] && echo \"$(basename $d) $(cat $d/pid 2>/dev/null)\"; done"])
+    out = []
+    for l in r.stdout.splitlines():
+        p = l.split()
+        if p:
+            out.append({"slot": p[0], "pid": int(p[1]) if len(p) > 1 and p[1].isdigit() else None})
+    return out
+
+
+def op_estado(_a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    caja = inspeccionar_caja()
+    hm = host_mem()
+    carga = Path("/proc/loadavg").read_text().split()[:3]
+    disco = shutil.disk_usage("/")
+    agentes = contar_agentes() if caja else 0
+    usada, limite = mem_caja() if caja else (0.0, 0.0)
+    limite = limite or float(cfg["MEM_GB"])
+    libre = max(0.0, min(limite - usada, hm["disponibleGb"]))
+    datos = {
+        "nodo": cfg["NODO"], "ts": ahora(),
+        "host": {"carga": [float(x) for x in carga], "nproc": os.cpu_count(), **hm,
+                 "discoPct": round(disco.used * 100 / disco.total)},
+        "caja": None if caja is None else {
+            "estado": caja["State"]["Status"], "runtime": caja["HostConfig"].get("Runtime"),
+            "init": bool(caja["HostConfig"].get("Init")),
+            "memGb": round((caja["HostConfig"].get("Memory") or 0) / GIB, 2),
+            "cpus": (caja["HostConfig"].get("NanoCpus") or 0) / 1e9,
+            "memUsadaGb": round(usada, 2), "zombies": zombies(), "creada": caja.get("Created"),
+        },
+        "capacidad": capacidad(float(cfg["MEM_GB"]), agentes, libre, cfg),
+        "suites": {"ocupadas": len(slots_ocupados()) if caja else 0},
+        "deriva": deriva(cfg, caja, hash_env(BOX_ENV)),
+    }
+    datos["alertas"] = alertas(cfg, datos)
+    return datos
+
+
+def op_suites(_a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    agentes = contar_agentes()
+    cap = capacidad(float(cfg["MEM_GB"]), agentes, float(cfg["MEM_GB"]), cfg)
+    occ = slots_ocupados()
+    return {"slots": cap["suitesCaben"], "ocupados": occ, "libres": max(0, cap["suitesCaben"] - len(occ)),
+            "agentes": agentes}
+
+
+# --- poda
+
+COMO_AGENT = ["sudo", "-u", "agent"]  # git en el workspace corre como el dueño de los archivos
+
+
+def _git(path: str, *args: str) -> subprocess.CompletedProcess:
+    return sh([*COMO_AGENT, "git", "-C", path, *args])
+
+
+def listar_worktrees(ws: str) -> list[str]:
+    r = sh(["find", ws, "-maxdepth", "4", "-name", ".git", "(", "-type", "f", "-o", "-type", "d", ")",
+            "-printf", "%h\n"])
+    return sorted(set(l for l in r.stdout.splitlines() if l))
+
+
+def clasificar(p: str, idle_dias: int = 3) -> dict:
+    rama = _git(p, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "?"
+    sucios = len([l for l in _git(p, "status", "--porcelain").stdout.splitlines() if l])
+    if _git(p, "rev-parse", "--abbrev-ref", "@{u}").returncode == 0:
+        sinpush = _git(p, "rev-list", "--count", "@{u}..HEAD").stdout.strip() or "0"
+    elif _git(p, "branch", "-r", "--contains", "HEAD").stdout.strip():
+        sinpush = "0"
+    else:
+        sinpush = "sin-upstream"
+    ultimo = int(_git(p, "log", "-1", "--format=%ct").stdout.strip() or 0)
+    gitdir = _git(p, "rev-parse", "--git-dir").stdout.strip()
+    idx = Path(p, gitdir, "index") if gitdir and not os.path.isabs(gitdir) else Path(gitdir or "/nonexistent", "index")
+    if idx.exists():
+        ultimo = max(ultimo, int(idx.stat().st_mtime))
+    dias = int((_dt.datetime.now().timestamp() - ultimo) // 86400)
+    tipo = "vinculado" if Path(p, ".git").is_file() else "clon"
+    if sucios:
+        balde = "retener-cambios"
+    elif sinpush != "0":
+        balde = "retener-sin-push"
+    elif dias < idle_dias:
+        balde = "reciente"
+    elif tipo == "clon":
+        balde = "clon-inactivo"
+    else:
+        balde = "seguro"
+    return {"path": p, "balde": balde, "tipo": tipo, "rama": rama, "sucios": sucios, "sinPush": sinpush,
+            "inactivoDias": dias, "orca": "/orca-workspaces/" in p}
+
+
+def podar_uno(cfg: dict, p: str) -> dict:
+    p = os.path.realpath(p)
+    ws = cfg["WORKSPACE"]
+    if not p.startswith(ws + "/"):
+        raise BoxError("operacion_invalida", f"solo se poda dentro de {ws}")
+    if p not in listar_worktrees(ws):
+        raise BoxError("worker_no_existe", f"no es un worktree conocido: {p}")
+    c = clasificar(p)
+    if c["balde"] != "seguro":
+        raise BoxError("operacion_invalida", f"no se poda, balde={c['balde']}", c)
+    comun = _git(p, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    raiz = str(Path(comun).parent)
+    r = _git(raiz, "worktree", "remove", p)
+    if r.returncode:
+        raise BoxError("error_interno", f"git worktree remove fallo: {r.stderr.strip()[:200]}")
+    _git(raiz, "worktree", "prune")
+    bitacora("podar", "ok", path=p)
+    return c
+
+
+def op_limpiar(a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    items = [clasificar(p) for p in listar_worktrees(cfg["WORKSPACE"])]
+    podados, salteados = [], []
+    if a.aplicar:
+        for it in items:
+            if it["balde"] != "seguro":
+                continue
+            if it["orca"]:
+                # Orca tiene que enterarse: lo poda boxctl desde la Mac con orca worktree rm.
+                salteados.append({"path": it["path"], "motivo": "gestionado-por-orca"})
+                continue
+            podados.append(podar_uno(cfg, it["path"])["path"])
+    return {"worktrees": items, "podables": [i["path"] for i in items if i["balde"] == "seguro"],
+            "aplicado": bool(a.aplicar), "podados": podados, "salteados": salteados}
+
+
+def op_podar(a) -> dict:
+    return {"podado": podar_uno(leer_env(BOX_ENV), a.path)}
+
+
+def op_caja_reiniciar(a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    agentes = contar_agentes(estricto=not a.forzar) if inspeccionar_caja() else 0
+    if agentes and not a.forzar:
+        raise BoxError("caja_ocupada", f"hay {agentes} agentes vivos en la caja; reiniciar los mata. "
+                       "Esperar a 0 o --forzar con OK de quien opera", {"agentes": agentes})
+    # Antes de matar nada: snapshot wip de todo lo sucio (refs/wip/<rama>/<ts>, push sin force).
+    salvado = op_salvar(argparse.Namespace(aplicar=True))
+    if salvado["fallos"] and not a.forzar:
+        raise BoxError("error_interno", "salvar fallo en algun worktree: no se reinicia (--forzar para seguir)",
+                       {"fallos": salvado["fallos"]})
+    sh(["docker", "rm", "-f", BOX])
+    r = sh(["sudo", "-u", "agent", WRAPPER, "-c", "true"], timeout=180, inp="")
+    if r.returncode:
+        bitacora("caja-reiniciar", "fallo", stderr=r.stderr.strip()[:300])
+        raise BoxError("error_interno", f"no se pudo recrear la caja: {r.stderr.strip()[:300]}")
+    caja = inspeccionar_caja()
+    dv = deriva(cfg, caja, hash_env(BOX_ENV))
+    bitacora("caja-reiniciar", "ok", forzado=bool(a.forzar), agentesMatados=agentes, deriva=len(dv))
+    return {"recreada": True, "agentesMatados": agentes, "deriva": dv,
+            "salvados": [{"path": x["path"], "ref": x["ref"], "pusheado": x.get("pusheado")} for x in salvado["salvados"]],
+            "aviso": "verificar Orca: orca repo list --environment <nodo> --json"}
+
+
+def op_mantenimiento(_a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    sh(["docker", "image", "prune", "-f"], timeout=300)
+    sh(["docker", "builder", "prune", "-f", "--filter", "until=168h"], timeout=300)
+    sh(["journalctl", "--vacuum-size=500M"], timeout=120)
+    # Cajas huerfanas: corriendo, gestionadas por Orca, que no son la caja compartida. Solo se informan.
+    r = sh(["docker", "ps", "--filter", "label=orca.managed=true", "--format", "{{.Names}}\t{{.RunningFor}}"])
+    huerfanas = [dict(zip(("nombre", "hace"), l.split("\t"))) for l in r.stdout.splitlines() if l]
+    seguros = sum(1 for p in listar_worktrees(cfg["WORKSPACE"]) if clasificar(p)["balde"] == "seguro")
+    disco = shutil.disk_usage("/")
+    pct = round(disco.used * 100 / disco.total)
+    bitacora("mantenimiento", "ok", discoPct=pct, podables=seguros)
+    return {"discoPct": pct, "podables": seguros, "cajasHuerfanas": huerfanas}
+
+
+def op_logs(a) -> dict:
+    if not LOG.exists():
+        return {"lineas": []}
+    lineas = LOG.read_text().splitlines()[-a.n:]
+    out = []
+    for l in lineas:
+        try:
+            out.append(json.loads(l))
+        except ValueError:
+            out.append({"crudo": l})
+    return {"lineas": out}
+
+
+def op_firewall(a) -> dict:
+    if not Path(EGRESS).exists():
+        raise BoxError("dependencia_faltante", f"falta {EGRESS} (install.sh)")
+    args = [EGRESS, a.accion]
+    if a.accion == "aplicar":
+        args += ["--deadman", str(a.deadman)]
+    r = sh(args, timeout=300)
+    bitacora(f"firewall-{a.accion}", "ok" if r.returncode == 0 else "fallo")
+    if r.returncode:
+        raise BoxError("error_interno", f"agent-box-egress {a.accion} fallo",
+                       {"salida": (r.stdout + r.stderr).strip()[-800:]})
+    return {"accion": a.accion, "salida": r.stdout.strip().splitlines()}
+
+
+# ---------------------------------------------------------------- alertas, gc y salvar
+#
+# Caso de referencia: 15 agentes + suites llevaron la caja a su techo (13 GiB), el swap
+# del host a 4/4 GB y carga 26; Orca dejo de responder y la caja se recreo sola (murieron los 15
+# claude). Bajo gVisor el OOM del cgroup mata la caja ENTERA (el sandbox es un proceso del host):
+# oom_score_adj adentro no salva a claude. Por eso el corte lo hace el vigia (gc --alcance memoria)
+# ANTES del techo, matando la suite mas grande, nunca a claude/codex/orcad.
+
+PROTEGIDOS_COMM = {"claude", "codex", "docker-init", "tini", "sleep", "sshd"}
+CANDIDATOS_HUERFANO = {"node", "jest", "vitest", "npm", "npx", "sh", "bash", "mongod", "chrome", "chromium",
+                       "chrome_crashpad", "headless_shell", "dotnet", "esbuild", "tsc", "MainThread"}
+RE_SUITE = re.compile(r"(^|/|\s)(jest|vitest)(\s|$)|jest-worker|processChild\.js|dotnet\S*\s+test|"
+                      r"\b(npm|pnpm|yarn)\s+(run\s+)?t(est)?(\s|$|:)")
+RE_ORCAD = re.compile(r"\.orca-remote/|orcad")
+
+
+def leer_procesos() -> list[dict]:
+    r = sh(["docker", "exec", BOX, "ps", "-eo", "pid=,ppid=,etimes=,rss=,comm=,args="])
+    out = []
+    for l in r.stdout.splitlines():
+        p = l.split(None, 5)
+        if len(p) >= 5 and p[0].isdigit():
+            out.append({"pid": int(p[0]), "ppid": int(p[1]), "edadS": int(p[2]), "rssKb": int(p[3]),
+                        "comm": p[4], "args": p[5] if len(p) > 5 else p[4]})
+    # cwd de cada proceso: un huerfano que trabaja en el worktree de un claude vivo (npm run dev &) se respeta.
+    r = sh(["docker", "exec", "-u", "root", BOX, "sh", "-c",
+            'for d in /proc/[0-9]*; do echo "${d#/proc/} $(readlink "$d/cwd" 2>/dev/null)"; done'])
+    cwd = dict(l.split(" ", 1) for l in r.stdout.splitlines() if " " in l)
+    for p in out:
+        p["cwd"] = cwd.get(str(p["pid"]), "")
+    return out
+
+
+def _protegido(p: dict) -> bool:
+    return p["pid"] == 1 or p["comm"] in PROTEGIDOS_COMM or bool(RE_ORCAD.search(p["args"]))
+
+
+def planear_gc_procesos(procs: list[dict], lim: dict, mem_usada_gb: float, mem_limite_gb: float) -> dict:
+    """Puro (testeable): que matar y por que. Nunca devuelve un proceso protegido ni a sus ancestros."""
+    por_pid = {p["pid"]: p for p in procs}
+    hijos: dict[int, list[int]] = {}
+    for p in procs:
+        hijos.setdefault(p["ppid"], []).append(p["pid"])
+
+    def ancestros(p):
+        vistos, cur = [], p
+        while cur and cur["ppid"] in por_pid and cur["ppid"] not in vistos:
+            cur = por_pid[cur["ppid"]]
+            vistos.append(cur["pid"])
+        return [por_pid[x] for x in vistos]
+
+    def subarbol(pid):
+        pila, out = [pid], []
+        while pila:
+            x = pila.pop()
+            out.append(x)
+            pila.extend(hijos.get(x, []))
+        return out
+
+    def rss_mb(pid):
+        return round(sum(por_pid[x]["rssKb"] for x in subarbol(pid) if x in por_pid) / 1024)
+
+    acciones, tomados = [], set()
+
+    def tomar(p, tipo, motivo):
+        pids = [x for x in subarbol(p["pid"]) if x in por_pid and not _protegido(por_pid[x])]
+        if not pids or p["pid"] in tomados:
+            return
+        tomados.update(pids)
+        acciones.append({"tipo": tipo, "pid": p["pid"], "pids": sorted(pids), "comm": p["comm"],
+                         "args": p["args"][:120], "rssMb": rss_mb(p["pid"]), "edadMin": p["edadS"] // 60,
+                         "motivo": motivo})
+
+    # 1. Huerfanos: colgados de PID 1 (su claude murio) y sin ningun protegido arriba. Los lanzados por
+    #    docker exec tienen ppid 0: esos son sesiones vivas, no huerfanos.
+    hmin = int(lim.get("GC_HUERFANO_MIN", 10)) * 60
+    vivos_cwd = [p.get("cwd") for p in procs if p["comm"] in ("claude", "codex") and p.get("cwd")]
+    for p in procs:
+        c = p.get("cwd") or ""
+        if c and any(c == v or c.startswith(v.rstrip("/") + "/") for v in vivos_cwd):
+            continue
+        if _protegido(p) or p["comm"] not in CANDIDATOS_HUERFANO or p["edadS"] < hmin:
+            continue
+        anc = ancestros(p)
+        if any(_protegido(a) and a["pid"] != 1 for a in anc):
+            continue
+        if p["ppid"] == 1 and not any(a["pid"] != 1 for a in anc):
+            tomar(p, "huerfano", f"sin agente padre hace {p['edadS'] // 60} min")
+
+    # 2. Suites (raiz = la de mas arriba que matchea): tope de tiempo y de RAM.
+    raices = [p for p in procs if RE_SUITE.search(p["args"]) and not _protegido(p)
+              and not any(RE_SUITE.search(a["args"]) for a in ancestros(p))]
+    tmax = int(lim.get("SUITE_MAX_MIN", 45)) * 60
+    rmax = float(lim.get("SUITE_MAX_GB", 6)) * 1024
+    for p in raices:
+        if p["edadS"] > tmax:
+            tomar(p, "suite-tiempo", f"{p['edadS'] // 60} min > {tmax // 60}")
+        elif rss_mb(p["pid"]) > rmax:
+            tomar(p, "suite-ram", f"{rss_mb(p['pid'])} MB > {int(rmax)}")
+
+    # 3. Memoria de la caja sobre el corte: matar la suite mas grande que quede (una por pasada).
+    pct = round(mem_usada_gb * 100 / mem_limite_gb) if mem_limite_gb else 0
+    alerta = pct >= int(lim.get("MEM_ALERTA_PCT", 80))
+    if pct >= int(lim.get("MEM_CORTE_PCT", 90)):
+        vivas = sorted((p for p in raices if p["pid"] not in tomados), key=lambda p: -rss_mb(p["pid"]))
+        if vivas:
+            tomar(vivas[0], "memoria-alta", f"caja al {pct}%: se corta la suite mas grande")
+    return {"memPct": pct, "alerta": alerta, "acciones": acciones}
+
+
+def matar(pids: list[int]) -> None:
+    if not pids:
+        return
+    lista = [str(x) for x in pids]
+    sh(["docker", "exec", "-u", "root", BOX, "kill", "-TERM", "--", *lista])
+    sh(["sleep", "5"])
+    sh(["docker", "exec", "-u", "root", BOX, "kill", "-KILL", "--", *lista])  # los que ya murieron: no-op
+
+
+def alertas(cfg: dict, datos: dict) -> list[dict]:
+    out = []
+    c = datos.get("caja") or {}
+    lim = c.get("memGb") or float(cfg["MEM_GB"])
+    if c.get("memUsadaGb") is not None and lim:
+        pct = round(c["memUsadaGb"] * 100 / lim)
+        if pct >= int(cfg.get("MEM_ALERTA_PCT", 80)):
+            out.append({"nivel": "alta" if pct >= int(cfg.get("MEM_CORTE_PCT", 90)) else "media",
+                        "que": "memoria-caja", "valor": pct})
+    h = datos["host"]
+    if h.get("swapUsadoGb", 0) >= 1:
+        out.append({"nivel": "alta", "que": "swap-host", "valor": h["swapUsadoGb"]})
+    if c.get("zombies", 0) >= 100:
+        out.append({"nivel": "media", "que": "zombies", "valor": c["zombies"]})
+    if h.get("discoPct", 0) >= 80:
+        out.append({"nivel": "media", "que": "disco", "valor": h["discoPct"]})
+    if datos.get("deriva"):
+        out.append({"nivel": "media", "que": "deriva", "valor": len(datos["deriva"])})
+    return out
+
+
+def avisar(cfg: dict, al: list[dict]) -> None:
+    """Alerta temprana: journal siempre; ALERTA_CMD (box.env) si esta, con el JSON por stdin."""
+    if not al:
+        return
+    txt = json.dumps(al, ensure_ascii=False)
+    sh(["logger", "-t", "agent-box", "-p", "user.warning", txt])
+    if cfg.get("ALERTA_CMD"):
+        sh(["sh", "-c", cfg["ALERTA_CMD"]], inp=txt, timeout=30)
+
+
+def op_gc(a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    alc = a.alcance
+    res: dict = {"alcance": alc, "aplicado": bool(a.aplicar)}
+    if alc in ("memoria", "procesos", "todo") and inspeccionar_caja():
+        usada, limite = mem_caja()
+        plan = planear_gc_procesos(leer_procesos(), cfg, usada, limite or float(cfg["MEM_GB"]))
+        if alc == "memoria":  # el vigia (cada 30 s) solo corta por memoria; huerfanos/tiempo van cada 10 min
+            plan["acciones"] = [x for x in plan["acciones"] if x["tipo"] in ("memoria-alta", "suite-ram")]
+        res["procesos"] = plan
+        if plan["alerta"]:
+            avisar(cfg, [{"nivel": "alta", "que": "memoria-caja", "valor": plan["memPct"]}])
+        if plan["acciones"] and not a.aplicar:
+            bitacora("gc-plan", "dry-run", acciones=[{k: x[k] for k in ("tipo", "pid", "rssMb", "motivo")}
+                                                    for x in plan["acciones"]])
+        if a.aplicar:
+            for x in plan["acciones"]:
+                matar(x["pids"])
+                bitacora("gc-kill", "ok", tipo=x["tipo"], pid=x["pid"], rssMb=x["rssMb"], motivo=x["motivo"])
+    if alc in ("disco", "todo"):
+        dias = int(cfg.get("GC_TMP_DIAS", 2))
+        filtro = ["find", "/tmp", "-mindepth", "1", "-maxdepth", "1", "-mtime", f"+{dias}",
+                  "!", "-name", "harness-gate-lock", "!", "-name", "claude-*", "!", "-name", ".X*"]
+        viejos = sh(["docker", "exec", "-u", "root", BOX, *filtro]).stdout.split() if inspeccionar_caja() else []
+        caches = []
+        cdias = int(cfg.get("GC_CACHE_DIAS", 3))
+        for p in listar_worktrees(cfg["WORKSPACE"]):
+            c = clasificar(p)
+            if c["sucios"] == 0 and c["inactivoDias"] >= cdias:
+                caches += [str(x) for x in (Path(p, "node_modules", ".cache"), Path(p, "coverage"),
+                                            Path(p, ".jest-cache")) if x.exists()]
+        res["tmp"] = viejos
+        res["caches"] = caches
+        if a.aplicar:
+            for chunk in range(0, len(viejos), 50):
+                sh(["docker", "exec", "-u", "root", BOX, "rm", "-rf", "--", *viejos[chunk:chunk + 50]])
+            raiz = os.path.realpath(cfg["WORKSPACE"])
+            for c in caches:
+                # El agente escribe en el workspace: un node_modules que es symlink a /root
+                # no puede terminar en un rmtree de root fuera del workspace.
+                if os.path.islink(c) or any(os.path.islink(str(x)) for x in Path(c).parents
+                                            if str(x).startswith(cfg["WORKSPACE"] + "/")):
+                    continue
+                if os.path.realpath(c).startswith(raiz + os.sep):
+                    shutil.rmtree(c, ignore_errors=True)
+        lim = op_limpiar(argparse.Namespace(aplicar=a.aplicar))
+        res["worktrees"] = {"podables": lim["podables"], "podados": lim["podados"], "salteados": lim["salteados"]}
+        bitacora("gc-disco", "ok" if a.aplicar else "dry-run", tmp=len(viejos), caches=len(caches),
+                 podados=len(lim["podados"]))
+    return res
+
+
+# --- salvar: snapshot wip de cada worktree sucio, sin tocar rama, index ni archivos del agente
+
+def snapshot_wip(p: str, cfg: dict, ts: str) -> dict:
+    """Commit de TODO el arbol (incluye no trackeados, respeta .gitignore) con un index temporal.
+    No mueve HEAD, no toca el index del agente ni sus archivos. Deja el commit en refs/wip/<rama>/<ts>."""
+    rama = _git(p, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "detached"
+    gitdir = _git(p, "rev-parse", "--absolute-git-dir").stdout.strip()
+    idx = os.path.join(gitdir, f"index.salvar.{os.getpid()}")
+    env_idx = {"GIT_INDEX_FILE": idx, "GIT_AUTHOR_NAME": cfg.get("GIT_NAME", "agent"),
+               "GIT_AUTHOR_EMAIL": cfg.get("GIT_EMAIL", "agent@localhost"),
+               "GIT_COMMITTER_NAME": cfg.get("GIT_NAME", "agent"),
+               "GIT_COMMITTER_EMAIL": cfg.get("GIT_EMAIL", "agent@localhost")}
+    pref = [*COMO_AGENT, "env", *[f"{k}={v}" for k, v in env_idx.items()], "git", "-C", p]
+    try:
+        if sh(pref + ["read-tree", "HEAD"]).returncode or sh(pref + ["add", "-A"], timeout=300).returncode:
+            raise BoxError("error_interno", f"no se pudo armar el arbol de {p}")
+        arbol = sh(pref + ["write-tree"]).stdout.strip()
+        commit = sh(pref + ["commit-tree", arbol, "-p", "HEAD", "-m", f"wip(salvar): {rama} {ts}"]).stdout.strip()
+    finally:
+        sh(["rm", "-f", idx])
+    ref = f"refs/wip/{rama}/{ts}"
+    _git(p, "update-ref", ref, commit)
+    return {"path": p, "rama": rama, "commit": commit, "ref": ref}
+
+
+def op_salvar(a) -> dict:
+    cfg = leer_env(BOX_ENV)
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    caja_viva = bool(inspeccionar_caja())
+    salvados, fallos, limpios = [], [], 0
+    for p in listar_worktrees(cfg["WORKSPACE"]):
+        c = clasificar(p)
+        if c["sucios"] == 0 and c["sinPush"] == "0":
+            limpios += 1
+            continue
+        if not a.aplicar:
+            salvados.append({"path": p, "rama": c["rama"], "sucios": c["sucios"], "sinPush": c["sinPush"],
+                             "ref": f"refs/wip/{c['rama']}/{ts}", "pusheado": False})
+            continue
+        try:
+            s = snapshot_wip(p, cfg, ts) if c["sucios"] else {"path": p, "rama": c["rama"], "commit": "HEAD",
+                                                               "ref": f"refs/wip/{c['rama']}/{ts}"}
+            if caja_viva:
+                # push desde ADENTRO de la caja: ahi estan las credenciales. Ref nueva por ts: nunca force.
+                src = s["commit"]
+                r = sh(["docker", "exec", "-u", "agent", "-w", p, BOX, "git", "push", "origin",
+                        f"{src}:{s['ref']}"], timeout=180)
+                s["pusheado"] = r.returncode == 0
+                if r.returncode:
+                    s["errorPush"] = r.stderr.strip()[-200:]
+            else:
+                s["pusheado"] = False
+                s["errorPush"] = "caja caida: queda solo el ref local (sobrevive al reinicio, esta en el bind-mount)"
+            salvados.append(s)
+        except BoxError as e:
+            fallos.append({"path": p, "mensaje": e.mensaje})
+    if a.aplicar:
+        bitacora("salvar", "ok" if not fallos else "parcial", salvados=len(salvados), fallos=len(fallos),
+                 pusheados=sum(1 for s in salvados if s.get("pusheado")))
+    return {"aplicado": bool(a.aplicar), "ts": ts, "salvados": salvados, "fallos": fallos, "limpios": limpios}
+
+
+# ---------------------------------------------------------------- pool (Mac)
+
+def leer_nodos() -> list[dict]:
+    if not NODOS_JSON.exists():
+        raise BoxError("config_invalida", f"falta {NODOS_JSON} (ver config/nodos.json.example)")
+    return json.loads(NODOS_JSON.read_text())["nodos"]
+
+
+def nodo(nombre: str) -> dict:
+    for n in leer_nodos():
+        if n["nombre"] == nombre:
+            return n
+    raise BoxError("nodo_desconocido", f"nodo desconocido: {nombre}")
+
+
+def remoto(n: dict, argv: list[str]) -> dict:
+    """Corre boxctl --json en el nodo y devuelve el sobre JSON. Propaga el error remoto."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", n["ssh"],
+           "sudo /usr/local/bin/boxctl --json " + " ".join(shlex.quote(x) for x in argv)]
+    r = sh(cmd, timeout=int(n.get("timeout", 120)))
+    if r.returncode == 255:
+        raise BoxError("nodo_inalcanzable", f"ssh {n['ssh']} fallo", {"stderr": r.stderr.strip()[-300:]})
+    if not r.stdout.strip() and (r.returncode == 127 or "not found" in r.stderr or "no such file" in r.stderr.lower()):
+        raise BoxError("dependencia_faltante", f"boxctl no esta instalado en {n['nombre']} (install.sh)",
+                       {"stderr": r.stderr.strip()[-300:]})
+    try:
+        sobre = json.loads(r.stdout)
+    except ValueError:
+        raise BoxError("error_interno", f"respuesta no JSON de {n['nombre']}", {"salida": r.stdout[-300:]})
+    if not sobre.get("ok"):
+        e = sobre.get("error", {})
+        raise BoxError(e.get("codigo", "error_interno") if e.get("codigo") in ERRORES else "error_interno",
+                       f"[{n['nombre']}] {e.get('mensaje', '')}", e.get("detalle"))
+    return sobre["datos"]
+
+
+def orca(*args: str, timeout: int = 120) -> dict:
+    r = sh([os.environ.get("ORCA_BIN", "orca"), *args, "--json"], timeout=timeout)
+    if r.returncode:
+        raise BoxError("error_interno", f"orca {' '.join(args[:2])} fallo: {(r.stderr or r.stdout).strip()[:300]}")
+    d = json.loads(r.stdout or "{}")
+    return d.get("result", d)
+
+
+def op_nodos(_a) -> dict:
+    out = []
+    for n in leer_nodos():
+        fila = {"nombre": n["nombre"], "habilitado": n.get("habilitado", True), "orcaEnvironment": n["orcaEnvironment"]}
+        if fila["habilitado"]:
+            try:
+                fila["estado"] = remoto(n, ["estado"])
+                fila["alcanzable"] = True
+            except BoxError as e:
+                fila.update(alcanzable=False, error={"codigo": e.codigo, "mensaje": e.mensaje})
+        out.append(fila)
+    return {"nodos": out}
+
+
+def elegir_nodo(nodos: list[dict]) -> dict:
+    cand = [n for n in nodos if n.get("alcanzable") and n["estado"]["capacidad"]["workersCaben"] > 0]
+    if not cand:
+        raise BoxError("capacidad_insuficiente", "ningun nodo tiene lugar para un worker mas",
+                       {"nodos": [{"nombre": n["nombre"], "capacidad": (n.get("estado") or {}).get("capacidad")}
+                                  for n in nodos]})
+    cand.sort(key=lambda n: (-n["estado"]["capacidad"]["workersCaben"],
+                             -n["estado"]["capacidad"]["suitesCaben"], n["nombre"]))
+    return cand[0]
+
+
+def _worktrees(env: str) -> list[dict]:
+    r = orca("worktree", "ps", "--environment", env)
+    items = r.get("worktrees") if isinstance(r, dict) else r
+    return items or []
+
+
+def iso_de_epoch(ts) -> str:
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return ""
+    if ts > 10**12:
+        ts = ts / 1000
+    return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def seguimiento_de(w: dict) -> str:
+    partes = []
+    issue = w.get("linkedIssue")
+    if isinstance(issue, dict):
+        partes.append(issue.get("title") or issue.get("identifier") or issue.get("url") or "")
+    elif isinstance(issue, str):
+        partes.append(issue)
+    pr = w.get("linkedPR")
+    if isinstance(pr, dict):
+        partes.append(pr.get("title") or pr.get("url") or "")
+    elif isinstance(pr, str):
+        partes.append(pr)
+    for it in w.get("linkedItems") or []:
+        if isinstance(it, dict):
+            partes.append(it.get("title") or it.get("url") or "")
+        elif isinstance(it, str):
+            partes.append(it)
+    comentario = (w.get("comment") or "").strip()
+    if comentario:
+        partes.append(comentario)
+    partes = [p for p in partes if p]
+    return " · ".join(partes) if partes else "sin seguimiento"
+
+
+def proyectar_worktree(w: dict) -> dict:
+    """Fila estable. Orca manda worktreeId, branch con refs/heads y lastActivityAt en ms.
+    worker lista antes leia id y agents, que este JSON no trae, y la fila salia vacia."""
+    rama = w.get("branch") or ""
+    if rama.startswith("refs/heads/"):
+        rama = rama[len("refs/heads/"):]
+    agentes = [ag.get("state") for ag in (w.get("agents") or []) if isinstance(ag, dict)]
+    return {
+        "id": w.get("id") or w.get("worktreeId"),
+        "path": w.get("path") or "",
+        "rama": rama,
+        "agentes": agentes,
+        "repo": w.get("repo") or "",
+        "nombre": w.get("displayName") or "",
+        "estado": w.get("workspaceStatus") or "",
+        "host": w.get("hostId") or "",
+        "terminales": int(w.get("liveTerminalCount") or 0),
+        "actividad": iso_de_epoch(w.get("lastActivityAt")),
+        "seguimiento": seguimiento_de(w),
+        "sinLeer": bool(w.get("unread")),
+        "archivado": bool(w.get("isArchived")),
+        "esPrincipal": bool(w.get("isMainWorktree")),
+    }
+
+
+def dir_reloj(explicito: str = "") -> Path:
+    if explicito:
+        return Path(explicito)
+    env = os.environ.get("AGENT_BOX_ESTADO", "")
+    if env:
+        return Path(env)
+    return Path.home() / ".local" / "share" / "agent-box" / "wi"
+
+
+def leer_reloj(directorio: Path) -> tuple[list[dict], list[str]]:
+    if not directorio.is_dir():
+        return [], [f"no hay estado de boxd en {directorio}"]
+    filas, avisos = [], []
+    for p in sorted(directorio.glob("*.json")):
+        try:
+            w = json.loads(p.read_text())
+        except (OSError, ValueError) as e:
+            avisos.append(f"{p.name}: {e}")
+            continue
+        if not isinstance(w, dict) or not w.get("id"):
+            avisos.append(f"{p.name}: no es un WI")
+            continue
+        tracker = w.get("tracker") if isinstance(w.get("tracker"), dict) else {}
+        act = w.get("actividad") if isinstance(w.get("actividad"), dict) else {}
+        corrida = w.get("corrida") if isinstance(w.get("corrida"), dict) else None
+        filas.append({
+            "id": w.get("id"),
+            "fase": w.get("fase") or "",
+            # En que esta la caja ahora: la escribe boxd, no el agente.
+            "etapa": act.get("etapa") or "",
+            "detalle": act.get("detalle") or "",
+            "desde": act.get("desde") or "",
+            "ultimoCambio": act.get("ultimoCambio") or "",
+            "archivos": act.get("archivos") or {},
+            "corrida": corrida and {
+                "tipo": corrida.get("tipo") or "", "codigo": corrida.get("codigo") or "",
+                "inicio": corrida.get("inicio") or "", "ms": corrida.get("ms") or 0,
+                "gates": [{"nombre": g.get("nombre"), "verde": bool(g.get("verde")), "ms": g.get("ms") or 0}
+                          for g in (corrida.get("gates") or []) if isinstance(g, dict)],
+            },
+            "fallosSeguidos": int(w.get("fallosSeguidos") or 0),
+            "repo": tracker.get("repo") or "",
+            "worktree": w.get("worktree") or "",
+            "ultimoGate": w.get("ultimoGate") or "",
+            "esperando": w.get("esperando") or [],
+            "huecos": w.get("huecos") or [],
+            "actualizado": w.get("actualizado") or "",
+        })
+    return filas, avisos
+
+
+def en_curso(filas: list[dict]) -> list[dict]:
+    """El clon principal quieto no es trabajo. Si tiene una terminal viva, entra."""
+    vivas = [f for f in filas if not f["archivado"] and (not f["esPrincipal"] or f["terminales"] > 0)]
+    vivas.sort(key=lambda f: (f["terminales"], f["actividad"]), reverse=True)
+    return vivas
+
+
+def partir_sesiones(filas: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Con terminal es lo que se está trabajando. El resto son worktrees que Orca
+    sigue marcando in-progress aunque nadie esté adentro."""
+    vivas = en_curso(filas)
+    return ([f for f in vivas if f["terminales"] > 0], [f for f in vivas if f["terminales"] == 0])
+
+
+def armar_panel(estado: Path | None = None, remotos: "NodosDeFondo | None" = None, con_metricas: bool = False) -> dict:
+    avisos: list[str] = []
+    sesiones: list[dict] = []
+    try:
+        r = orca("worktree", "ps", "--limit", "200", timeout=20)
+        items = r.get("worktrees") if isinstance(r, dict) else r
+        sesiones, abiertos = partir_sesiones(
+            [proyectar_worktree(w) for w in (items or []) if isinstance(w, dict)])
+    except BoxError as e:
+        avisos.append(e.mensaje)
+        sesiones, abiertos = [], []
+    reloj, extra = leer_reloj(estado or dir_reloj())
+    avisos.extend(extra)
+    # La caja y la sesion de Orca se juntan por el path del worktree.
+    por_path = {os.path.realpath(w["worktree"]): w for w in reloj if w["worktree"]}
+    for s in sesiones + abiertos:
+        w = por_path.get(os.path.realpath(s["path"])) if s["path"] else None
+        s["caja"] = {"wi": w["id"], "fase": w["fase"], "etapa": w["etapa"]} if w else None
+        if w:
+            w["sesion"] = {"nombre": s["nombre"], "rama": s["rama"], "host": s["host"], "terminales": s["terminales"]}
+    cajas, nodos = [], []
+    if con_metricas:
+        cajas, local = cajas_locales(estado or dir_reloj())
+        nodos = [local]
+        if remotos:
+            cr, nr = remotos.foto()
+            cajas, nodos = cajas + cr, nodos + nr
+        nombres = {os.path.realpath(s["path"]): s["nombre"] for s in sesiones + abiertos if s["path"]}
+        for c in cajas:
+            c["sesion"] = nombres.get(os.path.realpath(c.get("worktree") or "")) if c["nodo"] == "mac" else None
+    return {
+        "ts": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sesiones": sesiones,
+        "abiertos": abiertos,
+        "reloj": reloj,
+        "cajas": cajas,
+        "nodos": nodos,
+        "avisos": avisos,
+    }
+
+
+HTML_PANEL = Path(__file__).resolve().parent.parent / "panel" / "index.html"
+
+
+def boxd_local() -> str | None:
+    # Primero el que se compilo en este repo (make build): es el que corresponde a este panel.
+    del_repo = Path(__file__).resolve().parent.parent / "bin" / "boxd"
+    return os.environ.get("BOXD_BIN") or next(
+        (str(p) for p in [del_repo, Path.home() / ".local/bin/boxd"] if p.exists()), None) or shutil.which("boxd")
+
+
+def _cajas_de(salida: str, nodo_nombre: str) -> tuple[list[dict], dict]:
+    datos = (json.loads(salida) or {}).get("datos") or {}
+    cajas = datos.get("cajas") or []
+    for c in cajas:
+        c["nodo"] = nodo_nombre
+        c["eventos"] = (c.get("eventos") or [])[-14:]
+        # Lo que el panel no usa y pesa: comandos, baseline, pines.
+        for k in ("gates", "baseline", "viajes", "setup"):
+            c.pop(k, None)
+    return cajas, (datos.get("nodo") or {})
+
+
+def cajas_locales(estado: Path) -> tuple[list[dict], dict]:
+    """Cajas de esta maquina, con etapa al dia y RAM/CPU. Sin boxd, lo que diga el archivo."""
+    b = boxd_local()
+    if not b:
+        return [], {"nombre": "mac", "alcanzable": False, "error": "no encuentro boxd"}
+    r = sh([b, "--json", "--estado-dir", str(estado), "lista", "--observar", "--metricas"], timeout=25)
+    try:
+        cajas, n = _cajas_de(r.stdout, "mac")
+    except ValueError:
+        return [], {"nombre": "mac", "alcanzable": False, "error": (r.stderr or "boxd no respondio").strip()[:200]}
+    # En la Mac el presupuesto es la RAM de la VM de Docker, no el perfil de un nodo.
+    n.update(nombre="mac", alcanzable=True, presupuestoMb=None)
+    return cajas, n
+
+
+def cajas_de_nodo(n: dict) -> tuple[list[dict], dict]:
+    perfil = n.get("perfil") or n["nombre"]  # perfil de memoria que entiende boxd (--nodo)
+    r = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", n["ssh"], "sudo", "boxd", "--json",
+            "--estado-dir", "/var/lib/agent-box/wi", "--nodo", perfil, "lista", "--observar", "--metricas"], timeout=30)
+    try:
+        cajas, info = _cajas_de(r.stdout, n["nombre"])
+    except ValueError:
+        return [], {"nombre": n["nombre"], "alcanzable": False,
+                    "error": "sin respuesta por ssh" if r.returncode == 255 else "boxd no respondio"}
+    info.update(nombre=n["nombre"], alcanzable=True)
+    return cajas, info
+
+
+class NodosDeFondo:
+    """Los nodos se consultan por ssh en un hilo aparte: el panel no espera a ningun nodo."""
+
+    def __init__(self, cada: float = 15.0):
+        import threading
+        self.cada, self.traba = cada, threading.Lock()
+        self.cajas: list[dict] = []
+        self.nodos: list[dict] = []
+        self.hilo = threading.Thread(target=self._girar, daemon=True)
+
+    def arrancar(self):
+        self.hilo.start()
+        return self
+
+    def _girar(self):
+        from concurrent.futures import ThreadPoolExecutor
+        while True:
+            try:
+                nodos = [n for n in leer_nodos() if n.get("habilitado", True)]
+            except (BoxError, OSError, ValueError):
+                nodos = []
+            if nodos:
+                with ThreadPoolExecutor(max_workers=len(nodos)) as ex:
+                    res = list(ex.map(cajas_de_nodo, nodos))
+                with self.traba:
+                    self.cajas = [c for cs, _ in res for c in cs]
+                    self.nodos = [info for _, info in res]
+            time.sleep(self.cada)
+
+    def foto(self) -> tuple[list[dict], list[dict]]:
+        with self.traba:
+            return list(self.cajas), list(self.nodos)
+
+
+def panel_httpd(armar, puerto: int):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - firma de http.server
+            if self.path.split("?", 1)[0] == "/api/panel":
+                body = json.dumps(armar(), ensure_ascii=False).encode()
+                tipo = "application/json; charset=utf-8"
+            elif self.path.split("?", 1)[0] in ("/", "/index.html"):
+                body = HTML_PANEL.read_bytes()
+                tipo = "text/html; charset=utf-8"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", tipo)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    return ThreadingHTTPServer(("127.0.0.1", puerto), Handler)
+
+
+def con_cache(armar, segundos: float = 3.0):
+    """Varias pestañas abiertas piden lo mismo: se arma una vez cada `segundos`."""
+    import threading
+    traba, guardado = threading.Lock(), {"t": 0.0, "datos": None}
+
+    def leer():
+        with traba:
+            if guardado["datos"] is None or time.monotonic() - guardado["t"] > segundos:
+                guardado["datos"], guardado["t"] = armar(), time.monotonic()
+            return guardado["datos"]
+    return leer
+
+
+def servir_panel(armar, puerto: int) -> None:
+    httpd = panel_httpd(con_cache(armar), puerto)
+    host, port = httpd.server_address
+    print(f"panel en http://{host}:{port}", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        httpd.server_close()
+
+
+def op_panel(a) -> dict:
+    estado = dir_reloj(a.estado_dir)
+    if a.servir:
+        remotos = NodosDeFondo().arrancar()
+        servir_panel(lambda: armar_panel(estado, remotos, con_metricas=True), a.puerto)
+    return armar_panel(estado, con_metricas=True)
+
+
+def op_worker(a) -> dict:
+    if a.accion == "lista":
+        out = []
+        for n in leer_nodos():
+            if not n.get("habilitado", True):
+                continue
+            for w in _worktrees(n["orcaEnvironment"]):
+                fila = proyectar_worktree(w)
+                fila["nodo"] = n["nombre"]
+                out.append(fila)
+        return {"workers": out}
+
+    if a.accion == "alta":
+        if a.nodo in (None, "auto"):
+            elegido = elegir_nodo(op_nodos(a)["nodos"])
+        else:
+            n = nodo(a.nodo)
+            est = remoto(n, ["estado"])
+            if est["capacidad"]["workersCaben"] <= 0:
+                raise BoxError("capacidad_insuficiente", f"{n['nombre']} sin lugar", {"capacidad": est["capacidad"]})
+            elegido = {**n, "estado": est}
+        env = elegido["orcaEnvironment"]
+        plan = {"nodo": elegido["nombre"], "environment": env, "repo": a.repo, "rama": a.rama,
+                "base": a.base, "wi": a.wi, "capacidad": elegido["estado"]["capacidad"], "aplicado": False}
+        if not a.aplicar:
+            return plan
+        repos = {r["displayName"]: r["id"] for r in orca("repo", "list", "--environment", env)["repos"]}
+        if a.repo not in repos:
+            raise BoxError("repo_no_registrado", f"{a.repo} no esta registrado en el orcad de {env}",
+                           {"registrados": sorted(repos)})
+        w = orca("worktree", "create", "--environment", env, "--repo", f"id:{repos[a.repo]}", "--name", a.rama,
+                 "--no-parent", "--setup", "skip", "--base-branch", a.base, timeout=300)["worktree"]
+        plan.update(aplicado=True, worktree={"id": w.get("id"), "path": w.get("path"), "rama": w.get("branch")})
+        return plan
+
+    # baja
+    n = nodo(a.nodo) if a.nodo not in (None, "auto") else None
+    if n is None:
+        raise BoxError("operacion_invalida", "worker baja exige --nodo")
+    match = [w for w in _worktrees(n["orcaEnvironment"])
+             if a.worktree in (w.get("id"), w.get("worktreeId"), w.get("path"))]
+    if not match:
+        raise BoxError("worker_no_existe", f"{a.worktree} no existe en {n['nombre']}")
+    w = match[0]
+    vivos = [ag.get("state") for ag in (w.get("agents") or []) if ag.get("state") in ("working", "waiting", "blocked")]
+    if vivos and not a.forzar:
+        raise BoxError("worker_activo", "el worktree tiene agentes vivos", {"agentes": vivos})
+    res = {"nodo": n["nombre"], "worktree": w.get("path"), "aplicado": False}
+    if not a.forzar:
+        fila = next((it for it in remoto(n, ["limpiar"])["worktrees"] if it["path"] == w.get("path")), None)
+        if fila and (fila.get("sucios") or fila.get("sinPush")):
+            raise BoxError("worker_sucio", "el worktree tiene trabajo sin commitear o sin pushear; "
+                           "boxctl salvar --aplicar primero, o --forzar con OK de quien opera",
+                           {"sucios": fila.get("sucios"), "sinPush": fila.get("sinPush")})
+        res["balde"] = fila.get("balde") if fila else None
+    if a.aplicar:
+        orca("worktree", "rm", "--worktree", f"path:{w.get('path')}", "--environment", n["orcaEnvironment"])
+        res["aplicado"] = True
+    return res
+
+
+def limpiar_desde_mac(a) -> dict:
+    """limpiar --aplicar desde la Mac: los worktrees de Orca se borran con orca (si no, se desincroniza)."""
+    n = nodo(a.nodo)
+    d = remoto(n, ["limpiar"])
+    if not a.aplicar:
+        return d
+    conocidos = {w.get("path") for w in _worktrees(n["orcaEnvironment"])}
+    podados, fallos = [], []
+    for it in d["worktrees"]:
+        if it["balde"] != "seguro":
+            continue
+        try:
+            if it["path"] in conocidos:
+                orca("worktree", "rm", "--worktree", f"path:{it['path']}", "--environment", n["orcaEnvironment"])
+            else:
+                remoto(n, ["podar", it["path"]])
+            podados.append(it["path"])
+        except BoxError as e:
+            fallos.append({"path": it["path"], "codigo": e.codigo, "mensaje": e.mensaje})
+    return {**d, "aplicado": True, "podados": podados, "fallos": fallos}
+
+
+# ---------------------------------------------------------------- CLI
+
+VERBOS_NODO = {"estado": op_estado, "suites": op_suites, "limpiar": op_limpiar, "podar": op_podar,
+               "caja-reiniciar": op_caja_reiniciar, "mantenimiento": op_mantenimiento, "logs": op_logs,
+               "firewall": op_firewall, "gc": op_gc, "salvar": op_salvar}
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="boxctl", description="Box de agentes: contrato v%d" % CONTRATO)
+    p.add_argument("--json", action="store_true", help="salida JSON (contrato estable)")
+    p.add_argument("--nodo", help="nodo destino (nodos.json); en pool: auto")
+    sub = p.add_subparsers(dest="verbo", required=True)
+    sub.add_parser("version")
+    sub.add_parser("estado")
+    sub.add_parser("suites")
+    sp = sub.add_parser("limpiar"); sp.add_argument("--aplicar", action="store_true")
+    sp = sub.add_parser("podar"); sp.add_argument("path")
+    sp = sub.add_parser("caja-reiniciar"); sp.add_argument("--forzar", action="store_true")
+    sub.add_parser("mantenimiento")
+    sp = sub.add_parser("gc"); sp.add_argument("--aplicar", action="store_true")
+    sp.add_argument("--alcance", choices=["memoria", "procesos", "disco", "todo"], default="todo")
+    sp = sub.add_parser("salvar"); sp.add_argument("--aplicar", action="store_true")
+    sp = sub.add_parser("logs"); sp.add_argument("-n", type=int, default=30)
+    sp = sub.add_parser("firewall")
+    sp.add_argument("accion", choices=["estado", "aplicar", "confirmar", "quitar", "verificar", "refrescar"])
+    sp.add_argument("--deadman", type=int, default=600, help="segundos hasta el auto-rollback (aplicar)")
+    sub.add_parser("nodos")
+    sp = sub.add_parser("panel")
+    sp.add_argument("--servir", action="store_true", help="abre el panel en 127.0.0.1")
+    sp.add_argument("--puerto", type=int, default=4319)
+    sp.add_argument("--estado-dir", default="", help="directorio de WI de boxd")
+    sp = sub.add_parser("worker"); ws = sp.add_subparsers(dest="accion", required=True)
+    ws.add_parser("lista")
+    al = ws.add_parser("alta")
+    al.add_argument("--repo", required=True); al.add_argument("--rama", required=True)
+    al.add_argument("--wi"); al.add_argument("--base", default="origin/qa")
+    al.add_argument("--aplicar", action="store_true")
+    bj = ws.add_parser("baja")
+    bj.add_argument("--worktree", required=True); bj.add_argument("--aplicar", action="store_true")
+    bj.add_argument("--forzar", action="store_true")
+    return p
+
+
+def es_nodo_local(nombre: str | None) -> bool:
+    if not BOX_ENV.exists():
+        return False
+    if nombre is None:
+        return True
+    try:
+        return leer_env(BOX_ENV)["NODO"] == nombre
+    except BoxError:
+        return False
+
+
+def despachar(a, argv: list[str]) -> dict:
+    if a.verbo == "version":
+        return {"version": VERSION, "contrato": CONTRATO}
+    if a.verbo == "nodos":
+        return op_nodos(a)
+    if a.verbo == "panel":
+        return op_panel(a)
+    if a.verbo == "worker":
+        return op_worker(a)
+    # verbo de nodo
+    if es_nodo_local(a.nodo):
+        if os.geteuid() != 0:
+            raise BoxError("permiso", "los verbos de nodo corren con sudo")
+        return VERBOS_NODO[a.verbo](a)
+    if not a.nodo:
+        raise BoxError("operacion_invalida", "este host no es un nodo: pasar --nodo <nombre>")
+    if a.verbo == "limpiar":
+        return limpiar_desde_mac(a)
+    resto, saltar = [], False
+    for x in argv:
+        if saltar:
+            saltar = False
+        elif x == "--nodo":
+            saltar = True
+        elif x != "--json" and not x.startswith("--nodo="):
+            resto.append(x)
+    return remoto(nodo(a.nodo), resto)
+
+
+def render(datos, nivel=0) -> str:
+    pad = "  " * nivel
+    if isinstance(datos, dict):
+        out = []
+        for k, v in datos.items():
+            if isinstance(v, (dict, list)) and v:
+                out.append(f"{pad}{k}:")
+                out.append(render(v, nivel + 1))
+            else:
+                out.append(f"{pad}{k}: {v}")
+        return "\n".join(out)
+    if isinstance(datos, list):
+        return "\n".join(render(x, nivel) if isinstance(x, dict) else f"{pad}- {x}" for x in datos)
+    return f"{pad}{datos}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = parser()
+    try:
+        a = p.parse_args(argv)
+    except SystemExit as e:
+        if "--json" in argv and e.code:
+            print(json.dumps({"contrato": CONTRATO, "ok": False,
+                              "error": {"codigo": "operacion_invalida", "mensaje": "argumentos invalidos"}}))
+        return ERRORES["operacion_invalida"] if e.code else 0
+    op = a.verbo + (f" {a.accion}" if getattr(a, "accion", None) and a.verbo == "worker" else "")
+    try:
+        datos = despachar(a, argv)
+    except BoxError as e:
+        sobre = {"contrato": CONTRATO, "ok": False, "operacion": op,
+                 "error": {"codigo": e.codigo, "mensaje": e.mensaje, "detalle": e.detalle}}
+        if a.json:
+            print(json.dumps(sobre, ensure_ascii=False))
+        else:
+            print(f"error [{e.codigo}]: {e.mensaje}", file=sys.stderr)
+        return ERRORES[e.codigo]
+    except Exception as e:  # noqa: BLE001 - el contrato promete JSON tambien ante lo inesperado
+        if a.json:
+            print(json.dumps({"contrato": CONTRATO, "ok": False, "operacion": op,
+                              "error": {"codigo": "error_interno", "mensaje": f"{type(e).__name__}: {e}"}}))
+        else:
+            print(f"error [error_interno]: {type(e).__name__}: {e}", file=sys.stderr)
+        return ERRORES["error_interno"]
+    sobre = {"contrato": CONTRATO, "ok": True, "operacion": op, "datos": datos}
+    print(json.dumps(sobre, ensure_ascii=False) if a.json else render(datos))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

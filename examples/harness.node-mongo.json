@@ -1,0 +1,57 @@
+{
+  "_nota": "Ejemplo para un backend Node con tests que usan MongoDB en memoria. Corre adentro de una caja Linux. Las herramientas de /opt/caja se montan con --herramientas caja/herramientas.",
+  "setup": [
+    "git config --global --add safe.directory '*'",
+    "printf 'export MONGOMS_DISTRO=ubuntu-22.04\\nexport MONGOMS_DOWNLOAD_DIR=/opt/mongodb-binaries\\n' > /etc/profile.d/caja.sh && mkdir -p /opt/mongodb-binaries",
+    "if [ -L node_modules ]; then rm node_modules; fi; if [ -d node_modules ] && [ node_modules/.package-lock.json -nt package-lock.json ]; then echo 'node_modules al dia'; else npm ci --no-audit --no-fund; fi",
+    "calentar() { node -e \"require('mongodb-memory-server').MongoMemoryServer.create().then(async s=>{console.log('mongod listo',s.getUri().split('/')[2]);await s.stop()}).catch(e=>{console.error(String(e));process.exit(1)})\"; }; calentar || { echo 'descarga de mongod corrupta: se baja de nuevo'; rm -f /opt/mongodb-binaries/*.tgz /opt/mongodb-binaries/*.md5; calentar; }"
+  ],
+  "gates": [
+    {
+      "name": "lint",
+      "cmd": "node /opt/caja/lint-diff.js origin/main",
+      "hard": true,
+      "timeoutSec": 600,
+      "nota": "solo errores en lineas que la rama agrego o cambio"
+    },
+    {
+      "name": "type-check",
+      "cmd": "npx tsc --noEmit -p tsconfig.json",
+      "hard": true,
+      "timeoutSec": 900
+    },
+    {
+      "name": "test",
+      "cmd": "node /opt/caja/jest-nuevos.js origin/main -- --ci --maxWorkers=2",
+      "hard": true,
+      "timeoutSec": 2400,
+      "nota": "un test que tambien falla en la base se informa y no frena"
+    },
+    {
+      "name": "build",
+      "cmd": "npm run build",
+      "hard": true,
+      "timeoutSec": 900
+    },
+    {
+      "name": "e2e",
+      "cmd": "mkdir -p .caja && npx jest --config ./test/jest-e2e.json --ci --maxWorkers=1 --json --outputFile=.caja/e2e.json",
+      "hard": true,
+      "timeoutSec": 1200
+    }
+  ],
+  "e2e": {
+    "artifact": ".caja/e2e.json"
+  },
+  "reglas": {
+    "testsConCodigo": true,
+    "veredicto": true
+  },
+  "prTarget": "main",
+  "branchPrefix": "feature/",
+  "prTitlePrefix": "",
+  "tracker": {
+    "provider": "github",
+    "repo": "mi-org/mi-repo"
+  }
+}

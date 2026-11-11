@@ -1,0 +1,10 @@
+[Unit]
+Description=Vigia de memoria cada 30 s (bajo gVisor el OOM del cgroup mata la caja entera)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,32 @@
+# Dominios que la caja puede alcanzar (ademas de los rangos de api.github.com/meta).
+# Uno por linea. Se resuelven a IPv4 al aplicar y cada 30 min (agent-box-egress refrescar).
+# Limite del modelo por IP: un CDN compartido (npm via Cloudflare) deja pasar otros sitios del
+# mismo CDN. Es el mismo trade-off que el devcontainer oficial.
+
+# Claude Code / Anthropic
+api.anthropic.com
+statsig.anthropic.com
+sentry.io
+claude.ai
+console.anthropic.com
+# codex (esta en la imagen)
+api.openai.com
+# GitHub fuera de meta
+objects.githubusercontent.com
+raw.githubusercontent.com
+codeload.github.com
+# Azure DevOps (repositorios Git alojados en Azure Repos)
+dev.azure.com
+ssh.dev.azure.com
+vssps.dev.azure.com
+# Paquetes
+registry.npmjs.org
+registry.yarnpkg.com
+api.nuget.org
+globalcdn.nuget.org
+pypi.org
+files.pythonhosted.org
+# Prebajados en la imagen, por si un repo pide otra version
+fastdl.mongodb.org
+cdn.playwright.dev
+playwright.download.prss.microsoft.com

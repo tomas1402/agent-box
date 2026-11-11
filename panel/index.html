@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cajas</title>
+<style>
+  /* Sobrio: negro, grises y blanco. El color solo marca estado: verde lo que pasó, rojo lo que frena. */
+  :root {
+    color-scheme: dark;
+    --fondo: #000; --panel: #0a0a0a; --borde: #1f1f1f; --borde2: #2e2e2e; --relleno: #171717;
+    --texto: #ededed; --tenue: #a1a1a1; --apagado: #666;
+    --ok: #3fb950; --mal: #e5484d;
+    --sans: "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--fondo); color: var(--texto); }
+  body { font: 13px/1.45 var(--sans); min-height: 100vh; padding: 0 24px 48px; -webkit-font-smoothing: antialiased; }
+  .rot { font: 500 12px/1 var(--sans); color: var(--tenue); }
+
+  /* ---------- cabecera ---------- */
+  header { display: grid; grid-template-columns: auto 1fr auto; gap: 32px; align-items: center; padding: 20px 0 18px; border-bottom: 1px solid var(--borde); }
+  .marca b { display: block; font: 600 20px/1.1 var(--sans); letter-spacing: -.02em; }
+  .marca .rot { margin-top: 6px; display: block; }
+  .cifras { display: flex; gap: 36px; justify-content: center; flex-wrap: wrap; }
+  .cifra { display: flex; flex-direction: column-reverse; gap: 6px; }
+  .cifra b { font: 600 26px/1 var(--sans); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+  .cifra.fre:not(.cero) b { color: var(--mal); }
+  .cifra.cero b { color: var(--apagado); }
+  .reloj { text-align: right; }
+  .reloj b { display: block; font: 500 15px/1 var(--mono); font-variant-numeric: tabular-nums; color: var(--tenue); }
+  .enlace { display: inline-flex; align-items: center; gap: 7px; margin-top: 8px; }
+  .pip { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+  .caido .pip { background: var(--mal); }
+  .caido .enlace .rot { color: var(--mal); }
+
+  /* ---------- nodos ---------- */
+  .nodos { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 20px 0 4px; }
+  .nodo { border: 1px solid var(--borde); border-radius: 8px; background: var(--panel); padding: 12px 14px 13px; }
+  .nodo h2 { margin: 0; display: flex; justify-content: space-between; align-items: baseline; font: 500 13px/1 var(--sans); }
+  .nodo h2 span { font: 12px/1 var(--mono); color: var(--tenue); font-variant-numeric: tabular-nums; }
+  .celdas { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; margin-top: 11px; height: 4px; }
+  .celdas i { background: var(--borde); border-radius: 1px; transition: background .4s; }
+  .celdas i.on { background: var(--texto); } .celdas i.alto { background: var(--mal); }
+  .nodo.sin { border-color: rgba(229,72,77,.45); }
+  .nodo.sin h2 span { color: var(--mal); }
+
+  /* ---------- cajas ---------- */
+  .titulo-seccion { display: flex; align-items: center; margin: 28px 0 12px; }
+  .cajas { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+  .caja { position: relative; background: var(--panel); border: 1px solid var(--borde); border-radius: 8px; padding: 14px 16px 15px; transition: border-color .2s; }
+  .caja:hover { border-color: var(--borde2); }
+  .caja.nueva { animation: entra .35s ease-out both; }
+  @keyframes entra { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .caja.quieta .cuerpo, .caja.quieta .wi { opacity: .55; }
+  .caja.alerta { border-color: rgba(229,72,77,.5); }
+
+  .cab { display: flex; align-items: flex-start; gap: 10px; }
+  .wi { font: 600 22px/1 var(--sans); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+  .cab .lado { margin-left: auto; text-align: right; }
+  .fase { display: inline-flex; align-items: center; gap: 6px; font: 500 12px/1 var(--sans); color: var(--tenue); }
+  .fase::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--apagado); }
+  .caja:not(.quieta) .fase { color: var(--texto); }
+  .caja:not(.quieta) .fase::before { background: var(--texto); }
+  .caja.corriendo .fase::before { animation: pulso 1.4s ease-in-out infinite; }
+  .caja.lista .fase::before { background: var(--ok); }
+  .caja.alerta .fase { color: var(--mal); }
+  .caja.alerta .fase::before { background: var(--mal); }
+  .tiempo { display: block; margin-top: 7px; font: 12px/1 var(--mono); color: var(--tenue); font-variant-numeric: tabular-nums; }
+  .etq { display: flex; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
+  .etq span { font: 12px/1 var(--sans); color: var(--apagado); }
+  .etq span + span::before { content: "·"; margin-right: 8px; }
+  .nombre { margin: 12px 0 0; font: 400 13px/1.4 var(--sans); color: var(--tenue); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; min-height: 36px; }
+
+  /* etapas: cinco tramos; el activo es el único en blanco */
+  .etapas { display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px; margin: 12px 0 0; }
+  .etapa { height: 24px; background: transparent; border: 1px solid var(--borde); display: grid; place-items: center; font: 500 11px/1 var(--sans); color: var(--apagado); }
+  .etapa:first-child { border-radius: 5px 0 0 5px; } .etapa:last-child { border-radius: 0 5px 5px 0; }
+  .etapa.hecha { background: var(--relleno); border-color: var(--relleno); color: var(--tenue); }
+  .etapa.activa { background: var(--texto); border-color: var(--texto); color: #000; animation: pulso 1.8s ease-in-out infinite; }
+  .etapa.rota { border-color: rgba(229,72,77,.6); color: var(--mal); }
+  @keyframes pulso { 50% { opacity: .55; } }
+
+  .ahora { margin-top: 12px; min-height: 18px; font: 12px/1.5 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+  .ahora bdi { direction: ltr; }
+  .corriendo .ahora bdi::after { content: "▍"; margin-left: 2px; animation: cursor 1s steps(1) infinite; }
+  @keyframes cursor { 50% { opacity: 0; } }
+
+  .medidas { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; margin-top: 10px; }
+  .barra { position: relative; height: 4px; background: var(--borde); border-radius: 2px; overflow: hidden; }
+  .barra i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--tenue); border-radius: 2px; transition: width .6s ease-out; }
+  .barra.rafaga i { background: var(--texto); }
+  .dato { font: 12px/1 var(--mono); color: var(--apagado); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .dato b { color: var(--tenue); font-weight: 500; }
+  .cuenta { margin-top: 9px; }
+
+  .gates { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--borde); }
+  .gate { display: inline-flex; align-items: center; gap: 6px; font: 12px/1.4 var(--mono); color: var(--tenue); }
+  .gate::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+  .gate.rojo { color: var(--mal); }
+  .gate.rojo::before { background: var(--mal); }
+  .gate small { color: var(--apagado); font-size: 11px; }
+
+  .linea-tiempo { display: flex; align-items: center; gap: 2px; margin-top: 12px; height: 8px; }
+  .linea-tiempo i { flex: 1; max-width: 14px; height: 2px; background: var(--borde2); }
+  .linea-tiempo i.fase { background: var(--tenue); }
+  .linea-tiempo i.corrida { background: var(--texto); }
+  .linea-tiempo i.mal { background: var(--mal); }
+  .linea-tiempo i.bien { background: var(--ok); }
+  .linea-tiempo span { margin-left: 8px; font: 11px/1 var(--mono); color: var(--apagado); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .aviso-caja { margin-top: 10px; font: 500 12px/1.3 var(--sans); color: var(--mal); }
+
+  .vacio { border: 1px dashed var(--borde2); border-radius: 8px; padding: 36px 16px; text-align: center; color: var(--apagado); grid-column: 1 / -1; }
+  .vacio b { display: block; font: 500 14px/1 var(--sans); color: var(--tenue); margin-bottom: 8px; }
+
+  /* ---------- sesiones de Orca ---------- */
+  .envoltura { overflow-x: auto; border: 1px solid var(--borde); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--borde); vertical-align: top; }
+  th { font: 500 12px/1.2 var(--sans); color: var(--apagado); }
+  tr:last-child td { border-bottom: 0; }
+  td.t { color: var(--tenue); font: 12px/1.5 var(--mono); }
+  .chip { font: 12px/1 var(--sans); color: var(--apagado); white-space: nowrap; }
+  .chip.caja-si { color: var(--texto); }
+  .avisos p { margin: 12px 0 0; padding: 9px 12px; border: 1px solid var(--borde2); border-radius: 8px; color: var(--tenue); }
+  details summary { cursor: pointer; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+
+  @media (max-width: 760px) {
+    header { grid-template-columns: 1fr; gap: 16px; } .reloj { text-align: left; } .cifras { justify-content: flex-start; gap: 24px; }
+    .cajas { grid-template-columns: 1fr; } body { padding: 0 16px 32px; }
+  }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<header id="cabecera">
+  <div class="marca"><b>Cajas</b><span class="rot">agent-box · una caja por work item</span></div>
+  <div class="cifras" id="cifras"></div>
+  <div class="reloj"><b id="hora">--:--:--</b><span class="enlace"><i class="pip"></i><span class="rot" id="lectura">sin lectura</span></span></div>
+</header>
+<div class="avisos" id="avisos"></div>
+<div class="nodos" id="nodos"></div>
+<div class="titulo-seccion"><span class="rot">Cajas</span></div>
+<div class="cajas" id="cajas"></div>
+<details id="orca" open>
+  <summary class="titulo-seccion"><span class="rot" id="orca-rot">Sesiones de Orca</span></summary>
+  <div class="envoltura" id="sesiones"></div>
+</details>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, clase, texto) => { const e = document.createElement(tag); if (clase) e.className = clase; if (texto !== undefined) e.textContent = texto; return e; };
+
+const ETAPAS = ["Código", "Tests", "E2E", "Gates", "PR"];
+const FASE_TXT = { admitido: "En espera", trabajando: "Trabajando", frenado: "Frenado", escalado: "Escalado", listo: "Listo" };
+
+function duracion(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  const dos = (n) => String(n).padStart(2, "0");
+  return h ? h + ":" + dos(m) + ":" + dos(r) : dos(m) + ":" + dos(r);
+}
+function hace(iso) {
+  const t = Date.parse(iso); if (!t) return "";
+  const m = Math.round((Date.now() - t) / 60000);
+  if (m < 1) return "recién"; if (m < 60) return "hace " + m + " min";
+  if (m < 1440) return "hace " + Math.floor(m / 60) + " h " + (m % 60) + " min";
+  return "hace " + Math.floor(m / 1440) + " d";
+}
+const seg = (ms) => (ms >= 60000 ? Math.floor(ms / 60000) + "m" + String(Math.round((ms % 60000) / 1000)).padStart(2, "0") : ms >= 1000 ? Math.round(ms / 1000) + "s" : ms + "ms");
+
+// En qué tramo está la caja y cuáles ya pisó. Sale de lo que boxd escribió, no del agente.
+function tramos(c) {
+  const a = c.actividad || {}, arch = a.archivos || {}, gates = (c.corrida && c.corrida.gates) || [];
+  const esArchivo = (a.detalle || "").includes("/") || /\.[a-z]{1,5}$/i.test(a.detalle || "");
+  let activa = { codigo: 0, docs: 0, tests: 1, e2e: 2, gates: 3, publicando: 4 }[a.etapa];
+  if (a.etapa === "e2e" && !esArchivo) activa = 3; // boxd corriendo el gate de e2e, no el agente escribiéndolo
+  if (c.fase === "listo" || a.etapa === "inactiva" || a.etapa === "sin-cambios") activa = undefined;
+  const verdes = gates.length > 0 && gates.every((g) => g.verde);
+  const hecha = [!!(arch.codigo || arch.docs), !!arch.tests, !!arch.e2e, verdes, c.fase === "listo"];
+  if (c.fase === "listo") hecha.fill(true);
+  const rota = (c.fase === "frenado" || c.fase === "escalado") ? 3 : -1;
+  return { activa, hecha, rota, corriendo: activa === 3 || activa === 4 };
+}
+
+function tarjeta(c) {
+  const a = c.actividad || {}, m = c.metricas, t = tramos(c);
+  const alerta = c.fase === "frenado" || c.fase === "escalado";
+  const d = el("article", "caja");
+  if (alerta) d.classList.add("alerta");
+  else if (c.fase === "listo") d.classList.add("lista");
+  else if (t.corriendo) d.classList.add("corriendo");
+  if (!alerta && c.fase !== "listo" && (a.etapa === "inactiva" || a.etapa === "sin-cambios" || !a.etapa)) d.classList.add("quieta");
+  if (m && m.viva) d.classList.add("viva");
+
+  const cab = el("div", "cab");
+  const izq = el("div");
+  izq.appendChild(el("div", "wi", c.id));
+  const etq = el("div", "etq");
+  [c.nodo, (c.tracker && c.tracker.repo) || "", m && m.viva ? "caja viva" : "sin caja"].filter(Boolean).forEach((x) => etq.appendChild(el("span", "", x)));
+  izq.appendChild(etq);
+  const lado = el("div", "lado");
+  lado.appendChild(el("span", "fase", FASE_TXT[c.fase] || c.fase));
+  const tiempo = el("span", "tiempo");
+  const desde = a.desde || c.actualizado;
+  if (c.fase === "listo") tiempo.textContent = hace(c.actualizado);
+  else { tiempo.dataset.desde = desde || ""; tiempo.textContent = desde ? duracion(Date.now() - Date.parse(desde)) : ""; }
+  lado.appendChild(tiempo);
+  cab.append(izq, lado);
+
+  const cuerpo = el("div", "cuerpo");
+  cuerpo.appendChild(el("p", "nombre", c.titulo || c.sesion || c.rama || "sin título"));
+
+  const et = el("div", "etapas");
+  ETAPAS.forEach((texto, i) => {
+    const s = el("div", "etapa", texto);
+    if (i === t.rota) s.classList.add("rota");
+    else if (i === t.activa) s.classList.add("activa");
+    else if (t.hecha[i]) s.classList.add("hecha");
+    et.appendChild(s);
+  });
+  cuerpo.appendChild(et);
+
+  const ahora = el("div", "ahora");
+  ahora.appendChild(el("bdi", "", c.fase === "listo" ? (c.rama ? c.rama + " → " + (c.prTarget || "") : "publicado")
+    : a.etapa === "inactiva" ? "sin tocar archivos " + hace(a.ultimoCambio)
+    : a.etapa === "sin-cambios" ? "todavía sin cambios en la rama" : (a.detalle || "")));
+  cuerpo.appendChild(ahora);
+
+  const med = el("div", "medidas");
+  const barra = el("div", "barra"), relleno = el("i");
+  relleno.style.width = (m && m.techoMb ? Math.min(100, Math.round((m.memMb / m.techoMb) * 100)) : 0) + "%";
+  if (m && m.techoMb > 1500) barra.classList.add("rafaga");
+  barra.appendChild(relleno);
+  const ram = el("span", "dato");
+  if (m && m.viva) ram.append("RAM ", el("b", "", String(m.memMb)), " / " + m.techoMb + " MB" + (m.techoMb > 1500 ? " · ráfaga" : "") + " · CPU ", el("b", "", Math.round(m.cpuPct) + "%"));
+  else ram.textContent = "caja apagada";
+  med.append(barra, ram);
+  cuerpo.appendChild(med);
+
+  const arch = a.archivos || {};
+  const cuenta = el("div", "cuenta dato");
+  [["codigo", "código"], ["tests", "tests"], ["e2e", "e2e"], ["docs", "docs"]].forEach(([k, n]) => { if (arch[k]) cuenta.append(el("b", "", String(arch[k])), " " + n + "   "); });
+  if (cuenta.childNodes.length) cuerpo.appendChild(cuenta);
+
+  if (c.corrida && c.corrida.gates && c.corrida.gates.length) {
+    const g = el("div", "gates");
+    c.corrida.gates.forEach((x) => {
+      const chip = el("span", "gate" + (x.verde ? "" : " rojo"), x.nombre + " ");
+      chip.appendChild(el("small", "", seg(x.ms || 0)));
+      g.appendChild(chip);
+    });
+    cuerpo.appendChild(g);
+  }
+  if (alerta) cuerpo.appendChild(el("div", "aviso-caja", (c.fase === "escalado" ? "Escalado, te necesita · " : "Frenado en ") + (c.ultimoGate || "gate") + " · " + (c.fallosSeguidos || 0) + " de 3"));
+  if ((c.huecos || []).length) cuerpo.appendChild(el("div", "aviso-caja", "Criterios sin e2e: " + c.huecos.join(", ")));
+  if ((c.esperando || []).length) cuerpo.appendChild(el("div", "aviso-caja", "Espera a una persona: " + c.esperando.join(", ")));
+
+  const ev = c.eventos || [];
+  if (ev.length) {
+    const lt = el("div", "linea-tiempo");
+    ev.forEach((e) => {
+      const i = el("i");
+      if (e.que === "fase") i.className = e.valor === "listo" ? "bien" : (e.valor === "frenado" || e.valor === "escalado") ? "mal" : "fase";
+      else if (e.que === "corrida") i.className = e.detalle && e.detalle !== "ensayo_verde" ? "mal" : "corrida";
+      else if (e.que === "ensayo") i.className = "corrida";
+      i.title = e.ts + "  " + e.que + " " + e.valor + (e.detalle ? " · " + e.detalle : "");
+      lt.appendChild(i);
+    });
+    const u = ev[ev.length - 1];
+    lt.appendChild(el("span", "", u.que + " " + u.valor + " · " + hace(u.ts)));
+    cuerpo.appendChild(lt);
+  }
+  d.append(cab, cuerpo);
+  return d;
+}
+
+const vistas = new Map(); // clave -> {firma, nodo}
+function pintarCajas(cajas) {
+  const cont = $("cajas");
+  const orden = { escalado: 0, frenado: 1, trabajando: 2, admitido: 3, listo: 4 };
+  cajas.sort((x, y) => (orden[x.fase] ?? 9) - (orden[y.fase] ?? 9) || String(y.actualizado).localeCompare(String(x.actualizado)));
+  const presentes = new Set();
+  let previa = null;
+  cajas.forEach((c) => {
+    const clave = c.nodo + "/" + c.id, firma = JSON.stringify(c);
+    presentes.add(clave);
+    let v = vistas.get(clave);
+    if (!v || v.firma !== firma) {
+      const n = tarjeta(c);
+      if (v) v.nodo.replaceWith(n); else n.classList.add("nueva");
+      v = { firma, nodo: n };
+      vistas.set(clave, v);
+    }
+    // Reubicar sin recrear: las animaciones no se cortan en cada lectura.
+    const debe = previa ? previa.nextSibling : cont.firstChild;
+    if (v.nodo !== debe) cont.insertBefore(v.nodo, debe);
+    previa = v.nodo;
+  });
+  for (const [clave, v] of vistas) if (!presentes.has(clave)) { v.nodo.remove(); vistas.delete(clave); }
+  const vacio = $("vacio");
+  if (!cajas.length && !vacio) { const d = el("div", "vacio"); d.id = "vacio"; d.append(el("b", "", "Sin cajas"), "Ningún work item tiene caja. Se crean con boxd caja alta."); cont.appendChild(d); }
+  if (cajas.length && vacio) vacio.remove();
+}
+
+const cifrasPrevias = {};
+function cifra(clase, n, rotulo) {
+  const d = el("div", "cifra " + clase + (n ? "" : " cero"));
+  const de = cifrasPrevias[clase] ?? 0; cifrasPrevias[clase] = n;
+  const b = el("b", "", String(de));
+  // El número camina de a uno hasta el valor nuevo.
+  if (de !== n) { let v = de; const paso = () => { v += Math.sign(n - v); b.textContent = String(v); if (v !== n) setTimeout(paso, 60); }; paso(); }
+  d.append(b, el("span", "rot", rotulo));
+  return d;
+}
+
+function pintarNodos(nodos) {
+  const cont = $("nodos"); cont.replaceChildren();
+  nodos.forEach((n) => {
+    const d = el("div", "nodo" + (n.alcanzable ? "" : " sin"));
+    const h = el("h2", "", n.nombre);
+    h.appendChild(el("span", "", n.alcanzable ? (n.vivas || 0) + " viva" + ((n.vivas || 0) === 1 ? "" : "s") + " · " + (n.techosMb || 0) + (n.presupuestoMb ? " / " + n.presupuestoMb : "") + " MB" : (n.error || "sin enlace")));
+    d.appendChild(h);
+    const celdas = el("div", "celdas");
+    const tope = n.presupuestoMb || Math.max(6144, n.techosMb || 0);
+    const llenas = n.alcanzable ? Math.round(((n.techosMb || 0) / tope) * 24) : 0;
+    for (let i = 0; i < 24; i++) celdas.appendChild(el("i", i < llenas ? (llenas > 20 ? "alto" : "on") : ""));
+    d.appendChild(celdas);
+    cont.appendChild(d);
+  });
+}
+
+function pintarSesiones(datos) {
+  const filas = [...(datos.sesiones || []), ...(datos.abiertos || [])];
+  $("orca-rot").textContent = "Sesiones de Orca · " + (datos.sesiones || []).length + " con terminal · " + (datos.abiertos || []).length + " abiertas";
+  if (!filas.length) { $("sesiones").replaceChildren(el("div", "vacio", "Orca no reporta sesiones.")); return; }
+  const t = el("table"), th = el("tr");
+  ["Repo", "Trabajo", "Rama", "Estado", "Caja", "Term.", "Actividad", "Seguimiento"].forEach((c) => th.appendChild(el("th", "", c)));
+  t.appendChild(th);
+  filas.forEach((s) => {
+    const tr = el("tr");
+    tr.append(el("td", "", s.repo), el("td", "", s.nombre), el("td", "t", s.rama), el("td", "t", s.estado));
+    const td = el("td"); td.appendChild(el("span", "chip" + (s.caja ? " caja-si" : ""), s.caja ? s.caja.wi + " · " + (s.caja.etapa || s.caja.fase) : "sin caja")); tr.appendChild(td);
+    tr.append(el("td", "t", String(s.terminales)), el("td", "t", s.actividad), el("td", "t", s.seguimiento));
+    t.appendChild(tr);
+  });
+  $("sesiones").replaceChildren(t);
+}
+
+function pintar(datos) {
+  // Sin boxd a mano, el servidor manda solo `reloj`: se arma la misma forma con eso.
+  const cajas = (datos.cajas && datos.cajas.length) ? datos.cajas : (datos.reloj || []).map((w) => ({ ...w, nodo: "mac",
+    actividad: { etapa: w.etapa, detalle: w.detalle, desde: w.desde, archivos: w.archivos, ultimoCambio: w.ultimoCambio }, tracker: { repo: w.repo } }));
+  const en = (f) => cajas.filter(f).length;
+  $("cifras").replaceChildren(
+    cifra("act", en((c) => c.fase === "trabajando" || c.fase === "admitido"), "En curso"),
+    cifra("gat", en((c) => tramos(c).corriendo), "En gates"),
+    cifra("fre", en((c) => c.fase === "frenado" || c.fase === "escalado"), "Frenadas"),
+    cifra("lis", en((c) => c.fase === "listo"), "Listas"));
+  const av = $("avisos"); av.replaceChildren();
+  (datos.avisos || []).forEach((t) => av.appendChild(el("p", "", t)));
+  pintarNodos(datos.nodos || []);
+  pintarCajas(cajas);
+  pintarSesiones(datos);
+}
+
+let pidiendo = false, ultima = 0;
+async function cargar() {
+  if (pidiendo || document.hidden) return;
+  pidiendo = true;
+  try {
+    const r = await fetch("/api/panel");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    pintar(await r.json());
+    ultima = Date.now();
+    $("cabecera").classList.remove("caido");
+  } catch (e) {
+    $("cabecera").classList.add("caido"); // datos viejos sin aviso es peor que un cartel
+  } finally { pidiendo = false; }
+}
+setInterval(() => {
+  $("hora").textContent = new Date().toLocaleTimeString("es-AR", { hour12: false });
+  $("lectura").textContent = $("cabecera").classList.contains("caido") ? "sin respuesta del panel" : ultima ? "lectura hace " + Math.round((Date.now() - ultima) / 1000) + " s" : "leyendo";
+  document.querySelectorAll(".tiempo[data-desde]").forEach((t) => { const d = Date.parse(t.dataset.desde); if (d) t.textContent = duracion(Date.now() - d); });
+}, 1000);
+cargar();
+setInterval(cargar, 3000);
+document.addEventListener("visibilitychange", cargar);
+</script>
+</body>
+</html>

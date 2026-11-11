@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-box.local/contrato/1",
+  "title": "Sobre de salida de boxctl --json (contrato 1)",
+  "type": "object",
+  "required": [
+    "contrato",
+    "ok"
+  ],
+  "properties": {
+    "contrato": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "operacion": {
+      "type": "string"
+    },
+    "datos": {
+      "type": "object"
+    },
+    "error": {
+      "$ref": "#/$defs/error"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "datos"
+        ]
+      },
+      "else": {
+        "required": [
+          "error"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": [
+        "codigo",
+        "mensaje"
+      ],
+      "properties": {
+        "codigo": {
+          "enum": [
+            "error_interno",
+            "operacion_invalida",
+            "nodo_inalcanzable",
+            "capacidad_insuficiente",
+            "worker_no_existe",
+            "caja_ocupada",
+            "cuota_excedida",
+            "permiso",
+            "nodo_desconocido",
+            "dependencia_faltante",
+            "repo_no_registrado",
+            "config_invalida",
+            "worker_activo",
+            "worker_sucio"
+          ]
+        },
+        "mensaje": {
+          "type": "string"
+        },
+        "detalle": {
+          "type": "object"
+        }
+      }
+    },
+    "capacidad": {
+      "type": "object",
+      "required": [
+        "suitesCaben",
+        "workersCaben",
+        "agentes"
+      ],
+      "properties": {
+        "suitesCaben": {
+          "type": "integer"
+        },
+        "workersCaben": {
+          "type": "integer"
+        },
+        "agentes": {
+          "type": "integer"
+        },
+        "memCajaGb": {
+          "type": "number"
+        },
+        "memLibreGb": {
+          "type": "number"
+        }
+      }
+    },
+    "deriva": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "campo",
+          "esperado",
+          "actual"
+        ],
+        "properties": {
+          "campo": {
+            "enum": [
+              "memoria",
+              "swap",
+              "cpus",
+              "runtime",
+              "init",
+              "pids",
+              "red",
+              "config",
+              "orcaPersistente"
+            ]
+          }
+        }
+      }
+    },
+    "estado": {
+      "type": "object",
+      "required": [
+        "nodo",
+        "ts",
+        "host",
+        "caja",
+        "capacidad",
+        "suites",
+        "deriva"
+      ],
+      "properties": {
+        "nodo": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        },
+        "host": {
+          "type": "object",
+          "properties": {
+            "carga": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "nproc": {
+              "type": "integer"
+            },
+            "totalGb": {
+              "type": "number"
+            },
+            "disponibleGb": {
+              "type": "number"
+            },
+            "swapUsadoGb": {
+              "type": "number"
+            },
+            "discoPct": {
+              "type": "integer"
+            }
+          }
+        },
+        "caja": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "estado": {
+              "type": "string"
+            },
+            "runtime": {
+              "type": "string"
+            },
+            "init": {
+              "type": "boolean"
+            },
+            "memGb": {
+              "type": "number"
+            },
+            "cpus": {
+              "type": "number"
+            },
+            "memUsadaGb": {
+              "type": "number"
+            },
+            "zombies": {
+              "type": "integer"
+            },
+            "creada": {
+              "type": "string"
+            }
+          }
+        },
+        "capacidad": {
+          "$ref": "#/$defs/capacidad"
+        },
+        "suites": {
+          "type": "object",
+          "properties": {
+            "ocupadas": {
+              "type": "integer"
+            }
+          }
+        },
+        "deriva": {
+          "$ref": "#/$defs/deriva"
+        }
+      }
+    },
+    "workerAlta": {
+      "type": "object",
+      "required": [
+        "nodo",
+        "environment",
+        "repo",
+        "rama",
+        "aplicado",
+        "capacidad"
+      ],
+      "properties": {
+        "nodo": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "rama": {
+          "type": "string"
+        },
+        "base": {
+          "type": "string"
+        },
+        "wi": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "aplicado": {
+          "type": "boolean"
+        },
+        "capacidad": {
+          "$ref": "#/$defs/capacidad"
+        },
+        "worktree": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "rama": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

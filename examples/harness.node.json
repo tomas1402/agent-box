@@ -1,0 +1,45 @@
+{
+  "setup": [
+    "npm ci"
+  ],
+  "gates": [
+    {
+      "name": "lint",
+      "cmd": "npm run lint",
+      "hard": true,
+      "timeoutSec": 600
+    },
+    {
+      "name": "test",
+      "cmd": "npm test",
+      "hard": true,
+      "timeoutSec": 1200
+    },
+    {
+      "name": "build",
+      "cmd": "npm run build",
+      "hard": true,
+      "timeoutSec": 900
+    },
+    {
+      "name": "e2e",
+      "cmd": "mkdir -p e2e && PLAYWRIGHT_JSON_OUTPUT_FILE=e2e/report.json npx playwright test --reporter=json",
+      "hard": true,
+      "timeoutSec": 1200
+    }
+  ],
+  "e2e": {
+    "artifact": "e2e/report.json"
+  },
+  "prTarget": "main",
+  "branchPrefix": "feature/",
+  "prTitlePrefix": "",
+  "tracker": {
+    "provider": "github",
+    "repo": "mi-org/mi-repo"
+  },
+  "reglas": {
+    "testsConCodigo": true,
+    "veredicto": false
+  }
+}

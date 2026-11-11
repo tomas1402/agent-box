@@ -1,0 +1,7 @@
+[Unit]
+Description=GC de la caja: huerfanos de agentes muertos y suites que pasan su tope (boxctl gc)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agent-box/box.env
+ExecStart=/usr/local/bin/boxctl --json gc --alcance procesos $GC_APLICAR

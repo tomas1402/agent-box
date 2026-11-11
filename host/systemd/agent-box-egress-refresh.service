@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresca las IPs de la allowlist de egress de la caja (CDNs rotan)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/agent-box-egress refrescar

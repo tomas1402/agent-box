@@ -1,0 +1,7 @@
+{
+  "name": "agent-box",
+  "owner": {"name": "Tomás Pichierri"},
+  "plugins": [
+    {"name": "agent-box", "source": "./plugin/agent-box", "description": "Operar la box de agentes via boxctl"}
+  ]
+}
