@@ -49,7 +49,8 @@ medir() {
   echo "$s $(( ${disp_mb:-0} * 10 / 1024 ))"
 }
 
-TIENE_FLOCK=0; command -v flock >/dev/null 2>&1 && TIENE_FLOCK=1
+# GATE_LOCK_SIN_FLOCK=1 fuerza el modo sin flock aunque exista (para probar los dos modos en Linux).
+TIENE_FLOCK=0; [ -z "${GATE_LOCK_SIN_FLOCK:-}" ] && command -v flock >/dev/null 2>&1 && TIENE_FLOCK=1
 alive() { kill -0 "$1" 2>/dev/null; }
 
 ocupado() {  # ocupado <i>: exit 0 si el slot i esta tomado
