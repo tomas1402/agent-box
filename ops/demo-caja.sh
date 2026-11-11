@@ -4,6 +4,7 @@
 # y el modo ensayo de boxd. Al final borra las cajas que creo.
 #   bash ops/demo-caja.sh [directorio-de-trabajo]
 set -euo pipefail
+export AGENT_BOX_CONF=/dev/null   # la demo no usa tu configuracion de boxd
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 D="${1:-$HOME/.cache/agent-box-demo}/caja"
 IMG="${IMAGEN:-debian:bookworm-slim}"

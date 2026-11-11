@@ -9,6 +9,12 @@ import (
 	"testing"
 )
 
+// Los tests no leen la configuración de quien los corre.
+func TestMain(m *testing.M) {
+	os.Setenv("AGENT_BOX_CONF", os.DevNull)
+	os.Exit(m.Run())
+}
+
 func TestCLIPublicaSoloSiElGateDejaElE2EFresco(t *testing.T) {
 	raiz := t.TempDir()
 	wt := filepath.Join(raiz, "wt")
@@ -17,9 +23,9 @@ func TestCLIPublicaSoloSiElGateDejaElE2EFresco(t *testing.T) {
 	os.WriteFile(conf, []byte(`{
 	  "gates": [{"name": "test", "cmd": "mkdir -p e2e && touch e2e/report.json", "hard": true}],
 	  "e2e": {"artifact": "e2e/report.json"},
-	  "prTarget": "qa",
+	  "prTarget": "main",
 	  "branchPrefix": "feature/",
-	  "prTitlePrefix": "[t] ",
+	  "prTitlePrefix": "[demo] ",
 	  "tracker": {"provider": "azure", "repo": "repo-demo"}
 	}`), 0o644)
 	estado := filepath.Join(raiz, "estado")
@@ -87,7 +93,7 @@ func TestCLIPresupuestoNoCorreElGate(t *testing.T) {
 	os.WriteFile(conf, []byte(`{
 	  "gates": [{"name": "test", "cmd": "exit 7", "hard": true}],
 	  "e2e": {"artifact": "e2e/report.json"},
-	  "prTarget": "qa",
+	  "prTarget": "main",
 	  "branchPrefix": "feature/",
 	  "tracker": {"provider": "azure", "repo": "repo-demo"}
 	}`), 0o644)

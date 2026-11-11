@@ -58,10 +58,10 @@ TOOLS = {
         "description": "Elige nodo por capacidad y crea el worktree en Orca. Sin aplicar=true solo devuelve el plan.",
         "inputSchema": {"type": "object", "properties": {
             "repo": {"type": "string"}, "rama": {"type": "string"}, "wi": {"type": "string"},
-            "nodo": {"type": "string", "default": "auto"}, "base": {"type": "string", "default": "origin/qa"},
+            "nodo": {"type": "string", "default": "auto"}, "base": {"type": "string", "default": "origin/main"},
             "aplicar": {"type": "boolean", "default": False}}, "required": ["repo", "rama"]},
         "argv": lambda a: (["--nodo", a.get("nodo", "auto"), "worker", "alta", "--repo", a["repo"], "--rama", a["rama"],
-                            "--base", a.get("base", "origin/qa")]
+                            "--base", a.get("base", "origin/main")]
                            + (["--wi", str(a["wi"])] if a.get("wi") else [])
                            + (["--aplicar"] if a.get("aplicar") else [])),
     },

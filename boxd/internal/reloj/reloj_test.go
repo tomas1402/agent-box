@@ -16,9 +16,9 @@ const cfgBueno = `{
     {"name": "lint", "cmd": "echo no-cuento", "hard": false}
   ],
   "e2e": {"artifact": "e2e/report.json"},
-  "prTarget": "qa",
+  "prTarget": "main",
   "branchPrefix": "feature/",
-  "prTitlePrefix": "[t] ",
+  "prTitlePrefix": "[demo] ",
   "tracker": {"provider": "azure", "repo": "repo-demo"}
 }`
 
@@ -249,7 +249,7 @@ func TestE2EViejoNoPublicaYElFrescoSi(t *testing.T) {
 		t.Fatalf("comentario %s", disc)
 	}
 	pr := strings.Join(reg2.Llamadas[1], " ")
-	if !strings.Contains(pr, "az repos pr create") || !strings.Contains(pr, "--target-branch qa") || !strings.Contains(pr, "--work-items 123") {
+	if !strings.Contains(pr, "az repos pr create") || !strings.Contains(pr, "--target-branch main") || !strings.Contains(pr, "--work-items 123") {
 		t.Fatalf("pr %s", pr)
 	}
 	w, _ := st2.Load("123")

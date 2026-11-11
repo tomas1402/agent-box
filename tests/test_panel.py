@@ -38,11 +38,11 @@ class Proyeccion(unittest.TestCase):
         self.assertTrue(fila["actividad"].startswith("2026-"))
 
     def test_sin_terminal_no_cuenta_como_en_curso(self):
-        quieto = bx.proyectar_worktree({**WT, "liveTerminalCount": 0, "repo": "docproxy"})
+        quieto = bx.proyectar_worktree({**WT, "liveTerminalCount": 0, "repo": "repo-b"})
         vivo = bx.proyectar_worktree(WT)
         sesiones, abiertos = bx.partir_sesiones([quieto, vivo])
         self.assertEqual([f["repo"] for f in sesiones], ["frontends"])
-        self.assertEqual([f["repo"] for f in abiertos], ["docproxy"])
+        self.assertEqual([f["repo"] for f in abiertos], ["repo-b"])
 
     def test_el_clon_principal_quieto_no_entra(self):
         principal = {**WT, "isMainWorktree": True, "liveTerminalCount": 0, "repo": "yo"}

@@ -36,7 +36,9 @@ class GateLock(unittest.TestCase):
         (self.shim / "pgrep").write_text(f"#!/bin/sh\necho {agentes}\n")
         for f in ("free", "pgrep"):
             (self.shim / f).chmod(0o755)
-        return {**os.environ, "PATH": f"{self.shim}:{os.environ['PATH']}", "GATE_LOCK_POLL": "0.2"}
+        # Esta clase prueba el modo sin flock. En Linux flock existe, asi que se lo apaga a mano.
+        return {**os.environ, "PATH": f"{self.shim}:{os.environ['PATH']}", "GATE_LOCK_POLL": "0.2",
+                "GATE_LOCK_SIN_FLOCK": "1"}
 
     def slots(self, mem_gb, agentes, tope="auto", disponible_gb=None):
         r = subprocess.run([GL, self.grupo, tope, "--", "true"], capture_output=True, text=True,
@@ -109,7 +111,9 @@ class GateLockFlock(GateLock):
 
     def entorno(self, mem_gb, agentes, disponible_gb=None):
         env = super().entorno(mem_gb, agentes, disponible_gb)
-        (self.shim / "flock").write_text(FLOCK_FALSO); (self.shim / "flock").chmod(0o755)
+        env.pop("GATE_LOCK_SIN_FLOCK", None)
+        if not shutil.which("flock"):  # macOS no trae flock: se usa uno minimo
+            (self.shim / "flock").write_text(FLOCK_FALSO); (self.shim / "flock").chmod(0o755)
         return env
 
     def test_sin_slot_sale_75_al_vencer(self):
