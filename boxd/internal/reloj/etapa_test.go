@@ -185,7 +185,7 @@ func TestDosPublicarALaVezElSegundoNoCorre(t *testing.T) {
 
 func TestGateColgadoSeCortaConTodoSuArbol(t *testing.T) {
 	cfg := `{"gates":[{"name":"test","cmd":"sleep 30 & echo $! > hijo.pid; wait","hard":true,"timeoutSec":1}],
-	 "e2e":{"artifact":"e2e/report.json"},"prTarget":"qa","branchPrefix":"feature/","tracker":{"provider":"azure","repo":"r"}}`
+	 "e2e":{"artifact":"e2e/report.json"},"prTarget":"main","branchPrefix":"feature/","tracker":{"provider":"azure","repo":"r"}}`
 	st, wt := preparar(t, cfg)
 	t0 := time.Now()
 	inf, err := Publicar(context.Background(), st, "123", Opciones{

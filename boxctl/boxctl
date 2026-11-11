@@ -1181,7 +1181,7 @@ def parser() -> argparse.ArgumentParser:
     ws.add_parser("lista")
     al = ws.add_parser("alta")
     al.add_argument("--repo", required=True); al.add_argument("--rama", required=True)
-    al.add_argument("--wi"); al.add_argument("--base", default="origin/qa")
+    al.add_argument("--wi"); al.add_argument("--base", default="origin/main")
     al.add_argument("--aplicar", action="store_true")
     bj = ws.add_parser("baja")
     bj.add_argument("--worktree", required=True); bj.add_argument("--aplicar", action="store_true")

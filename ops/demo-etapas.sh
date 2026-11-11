@@ -1,11 +1,12 @@
 #!/bin/bash
 set -e
+export AGENT_BOX_CONF=/dev/null   # la demo no usa tu configuracion de boxd
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; D="${1:-$HOME/.cache/agent-box-demo}/etapas"
 rm -rf "$D"; mkdir -p "$D/wt" "$D/estado"
-(cd "$D/wt" && git init -q -b feature/us-1 . && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base)
+(cd "$D/wt" && git init -q -b feature/1 . && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base)
 cat > "$D/harness.json" <<'J'
 {"gates":[{"name":"lint","cmd":"sleep 1; echo ok","hard":true},{"name":"e2e","cmd":"sleep 2; mkdir -p e2e && echo '{}' > e2e/report.json","hard":true}],
- "e2e":{"artifact":"e2e/report.json"},"prTarget":"qa","branchPrefix":"feature/us-","prTitlePrefix":"[t] ","tracker":{"provider":"azure","repo":"demo"}}
+ "e2e":{"artifact":"e2e/report.json"},"prTarget":"main","branchPrefix":"feature/","prTitlePrefix":"[demo] ","tracker":{"provider":"azure","repo":"demo"}}
 J
 (cd "$REPO/boxd" && go build -o "$D/boxd" ./cmd/boxd)
 b() { "$D/boxd" --json --estado-dir "$D/estado" "$@"; }

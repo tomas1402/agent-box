@@ -3,12 +3,12 @@
 // Corre la suite entera; si algo falla, vuelve a correr SOLO esos archivos sobre una
 // copia de la base (git archive, sin tocar el repo). Un test que tambien falla en la
 // base ya estaba roto: se informa y no frena. Uno que en la base pasa, frena.
-// Uso (adentro de la caja, parado en el repo): node /opt/caja/jest-nuevos.js origin/qa -- --ci --maxWorkers=2
+// Uso (adentro de la caja, parado en el repo): node /opt/caja/jest-nuevos.js origin/main -- --ci --maxWorkers=2
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const base = process.argv[2] || 'origin/qa';
+const base = process.argv[2] || 'origin/main';
 const sep = process.argv.indexOf('--');
 const extra = sep >= 0 ? process.argv.slice(sep + 1) : [];
 const raiz = process.cwd();

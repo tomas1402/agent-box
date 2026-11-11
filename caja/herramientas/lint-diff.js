@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Lint que solo falla por errores en lineas que la rama agrego o cambio.
 // La deuda vieja de un archivo tocado no frena el PR, y un error nuevo si.
-// Uso (adentro de la caja, parado en el repo): node /opt/caja/lint-diff.js origin/qa
+// Uso (adentro de la caja, parado en el repo): node /opt/caja/lint-diff.js origin/main
 const { execFileSync } = require('child_process');
 const path = require('path');
 
-const base = process.argv[2] || 'origin/qa';
+const base = process.argv[2] || 'origin/main';
 const git = (...a) => execFileSync('git', a, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 
 const archivos = git('diff', '--name-only', '--diff-filter=ACMR', base, '--', '*.ts')
